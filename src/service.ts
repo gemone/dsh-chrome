@@ -64,6 +64,8 @@ type ConnectionState =
   | { kind: 'idle' }
   | { kind: 'connecting'; promise: Promise<ActiveConnection> }
   | { kind: 'connected'; active: ActiveConnection }
+  /** Browser connection alive, but the page target was closed (e.g. via closeTab). */
+  | { kind: 'connected-browser'; client: CdpClient; launched?: LaunchedChrome }
   | { kind: 'disposed' }
 
 /** A live browser connection driving one page target. */
@@ -112,6 +114,17 @@ export class ChromeRuntime extends Service {
       await this.closeActive(active).catch(() => undefined)
       this.state = { kind: 'idle' }
     }
+    if (this.state.kind === 'connected-browser') {
+      const { client, launched } = this.state
+      if (client.isClosed) {
+        this.state = { kind: 'idle' }
+        return this.ensure(signal)
+      }
+      // Browser alive but no target: create a fresh page target on the existing connection.
+      const active = await this.createTargetOnClient(client, launched, signal)
+      this.state = { kind: 'connected', active }
+      return active
+    }
     if (this.state.kind === 'disposed') {
       throw new ChromeError('Chrome runtime has been disposed', 'CHROME_CDP_ERROR')
     }
@@ -153,23 +166,31 @@ export class ChromeRuntime extends Service {
 
     const client = await createCdpClient(webSocketDebuggerUrl, signal)
     try {
-      // Create a dedicated page target and attach via the flattened session protocol.
-      const created = await client.send('Target.createTarget', { url: 'about:blank' }, { signal }) as { targetId: string }
-      const targetId = created.targetId
-      const attached = await client.send('Target.attachToTarget', { targetId, flatten: true }, { signal }) as { sessionId: string }
-      const sessionId = attached.sessionId
-      const network: NetworkState = { inflight: new Set() }
-      // Enable the domains the tools rely on; failures here are infrastructure errors.
-      await client.send('Page.enable', undefined, { sessionId, signal })
-      await client.send('Runtime.enable', undefined, { sessionId, signal })
-      await client.send('Network.enable', undefined, { sessionId, signal })
-      this.trackNetwork(client, sessionId, network)
-      return { client, targetId, sessionId, launched, network }
+      return await this.createTargetOnClient(client, launched, signal)
     } catch (error) {
       await client.close()
       if (launched?.child !== undefined) await disposeChild(launched.child).catch(() => undefined)
       throw error
     }
+  }
+
+  /**
+   * Create a fresh page target on an existing browser-level CDP connection and
+   * attach via the flattened session protocol. Used by both `connect()` (first
+   * attach) and the `connected-browser` state (after a tab was closed).
+   */
+  private async createTargetOnClient(client: CdpClient, launched: LaunchedChrome | undefined, signal?: AbortSignal): Promise<ActiveConnection> {
+    const created = await client.send('Target.createTarget', { url: 'about:blank' }, { signal }) as { targetId: string }
+    const targetId = created.targetId
+    const attached = await client.send('Target.attachToTarget', { targetId, flatten: true }, { signal }) as { sessionId: string }
+    const sessionId = attached.sessionId
+    const network: NetworkState = { inflight: new Set() }
+    // Enable the domains the tools rely on; failures here are infrastructure errors.
+    await client.send('Page.enable', undefined, { sessionId, signal })
+    await client.send('Runtime.enable', undefined, { sessionId, signal })
+    await client.send('Network.enable', undefined, { sessionId, signal })
+    this.trackNetwork(client, sessionId, network)
+    return { client, targetId, sessionId, launched, network }
   }
 
   /** Subscribe to Network events to maintain the `networkidle*` inflight set. */
@@ -309,6 +330,43 @@ export class ChromeRuntime extends Service {
   async cdp(request: { method: string; params?: Record<string, unknown> }, signal?: AbortSignal): Promise<unknown> {
     const active = await this.ensure(signal)
     return active.client.send(request.method, request.params, { sessionId: active.sessionId, signal })
+  }
+
+  /**
+   * Close the current page target (tab). The browser-level connection stays
+   * alive; the next tool call auto-creates a fresh target on the same browser.
+   */
+  async closeTab(signal?: AbortSignal): Promise<void> {
+    const active = await this.ensure(signal)
+    try {
+      await active.client.send('Target.closeTarget', { targetId: active.targetId }, { signal })
+    } finally {
+      if (active.network.timer !== undefined) clearTimeout(active.network.timer)
+      this.state = { kind: 'connected-browser', client: active.client, launched: active.launched }
+    }
+  }
+
+  /**
+   * Close the entire browser: dispose the CDP connection and kill the child
+   * process (when the runtime owns it). After this, the next tool call
+   * re-launches a fresh Chrome if `launch: true`.
+   */
+  async closeBrowser(): Promise<void> {
+    const previous = this.state
+    this.state = { kind: 'idle' }
+    if (previous.kind === 'connected') {
+      await this.closeActive(previous.active).catch(() => undefined)
+    } else if (previous.kind === 'connected-browser') {
+      try { previous.client.close() } catch { /* ignore */ }
+      if (previous.launched?.child !== undefined) {
+        await disposeChild(previous.launched.child).catch(() => undefined)
+      }
+    } else if (previous.kind === 'connecting') {
+      try {
+        const active = await previous.promise
+        await this.closeActive(active).catch(() => undefined)
+      } catch { /* connect failed */ }
+    }
   }
 
   /** Start an event-based load waiter for one {@link WaitUntil} lifecycle. */

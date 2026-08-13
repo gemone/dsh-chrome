@@ -22,6 +22,10 @@ import { applyChromeEvaluateTool } from './tools/evaluate.ts'
 import { applyChromeSnapshotTool } from './tools/snapshot.ts'
 import { applyChromeClickTool } from './tools/click.ts'
 import { applyChromeScreenshotTool } from './tools/screenshot.ts'
+import { applyChromeScrollTool } from './tools/scroll.ts'
+import { applyChromeTypeTool } from './tools/type.ts'
+import { applyChromePressKeyTool } from './tools/press-key.ts'
+import { applyChromeCloseTool } from './tools/close.ts'
 
 export { ChromeError } from './types.ts'
 export type {
@@ -38,6 +42,10 @@ export {
   applyChromeSnapshotTool,
   applyChromeClickTool,
   applyChromeScreenshotTool,
+  applyChromeScrollTool,
+  applyChromeTypeTool,
+  applyChromePressKeyTool,
+  applyChromeCloseTool,
 } from './tools/index.ts'
 
 /** Default remote debugging port for a launched Chrome. */
@@ -70,6 +78,14 @@ export interface Config {
   click?: boolean
   /** Register `chrome_screenshot`. Defaults to true. */
   screenshot?: boolean
+  /** Register `chrome_scroll`. Defaults to true. */
+  scroll?: boolean
+  /** Register `chrome_type`. Defaults to true. */
+  type?: boolean
+  /** Register `chrome_press_key`. Defaults to true. */
+  pressKey?: boolean
+  /** Register `chrome_close`. Defaults to true. */
+  close?: boolean
   /** Explicit Chrome executable path; omitted = discover. */
   executablePath?: string
   /** Launch a managed Chrome. False = attach to `cdpUrl`. Defaults to true. */
@@ -100,6 +116,10 @@ export const Config: z<Config> = z.object({
   snapshot: z.boolean().default(true),
   click: z.boolean().default(true),
   screenshot: z.boolean().default(true),
+  scroll: z.boolean().default(true),
+  type: z.boolean().default(true),
+  pressKey: z.boolean().default(true),
+  close: z.boolean().default(true),
   executablePath: z.string(),
   launch: z.boolean().default(true),
   cdpUrl: z.string(),
@@ -120,6 +140,10 @@ type ResolvedConfig = {
   snapshot: boolean
   click: boolean
   screenshot: boolean
+  scroll: boolean
+  type: boolean
+  pressKey: boolean
+  close: boolean
   executablePath: string | undefined
   launch: boolean
   cdpUrl: string | undefined
@@ -183,4 +207,8 @@ export function apply(ctx: Context, config: Config): void {
   if (resolved.snapshot) applyChromeSnapshotTool(ctx, chrome, resolved.operationTimeoutMs, resolved.snapshotMaxChars)
   if (resolved.click) applyChromeClickTool(ctx, chrome, resolved.operationTimeoutMs)
   if (resolved.screenshot) applyChromeScreenshotTool(ctx, chrome, resolved.operationTimeoutMs)
+  if (resolved.scroll) applyChromeScrollTool(ctx, chrome, resolved.operationTimeoutMs)
+  if (resolved.type) applyChromeTypeTool(ctx, chrome, resolved.operationTimeoutMs)
+  if (resolved.pressKey) applyChromePressKeyTool(ctx, chrome, resolved.operationTimeoutMs)
+  if (resolved.close) applyChromeCloseTool(ctx, chrome, resolved.operationTimeoutMs)
 }

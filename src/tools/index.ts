@@ -15,3 +15,11 @@ export {
   mediaTypeForFormat,
 } from './screenshot.ts'
 export type { ChromeScreenshotValue } from './screenshot.ts'
+export { applyChromeScrollTool } from './scroll.ts'
+export type { ChromeScrollValue } from './scroll.ts'
+export { applyChromeTypeTool } from './type.ts'
+export type { ChromeTypeValue } from './type.ts'
+export { applyChromePressKeyTool } from './press-key.ts'
+export type { ChromePressKeyValue } from './press-key.ts'
+export { applyChromeCloseTool } from './close.ts'
+export type { ChromeCloseValue } from './close.ts'

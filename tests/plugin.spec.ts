@@ -5,7 +5,7 @@ import ToolRuntime from '@deepseek-ai/dsh-tools'
 import { apply, Config, name, inject } from '../src/index.ts'
 import { ChromeRuntime } from '../src/service.ts'
 
-const EXPECTED_TOOLS = ['chrome_navigate', 'chrome_evaluate', 'chrome_snapshot', 'chrome_click', 'chrome_screenshot']
+const EXPECTED_TOOLS = ['chrome_navigate', 'chrome_evaluate', 'chrome_snapshot', 'chrome_click', 'chrome_screenshot', 'chrome_scroll', 'chrome_type', 'chrome_press_key', 'chrome_close']
 
 async function setup() {
   const ctx = new Context()
