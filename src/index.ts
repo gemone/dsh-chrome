@@ -1,0 +1,186 @@
+/**
+ * `dsh-chrome`: a DeepSeek Harness plugin bundle that gives the agent
+ * model-facing tools to drive a real Chrome browser over the Chrome DevTools
+ * Protocol (CDP).
+ *
+ * The plugin registers a {@link ChromeRuntime} service as `ctx.chrome` (owning
+ * the Chrome process and CDP connection lifecycle) and a family of
+ * `defineTool` consumers over it: `chrome_navigate`, `chrome_evaluate`,
+ * `chrome_snapshot`, `chrome_click`, and `chrome_screenshot`.
+ *
+ * Install into a profile with `dsh plugin --profile <name> add ./dsh-chrome`
+ * (or `github:.../dsh-chrome`, a tarball, or the published package). See
+ * README.md for configuration and the full tool reference.
+ * @module dsh-chrome
+ */
+
+import type { Context } from '@deepseek-ai/cordis'
+import z from '@deepseek-ai/schemastery'
+import { ChromeRuntime, type ChromeRuntimeConfig } from './service.ts'
+import { applyChromeNavigateTool } from './tools/navigate.ts'
+import { applyChromeEvaluateTool } from './tools/evaluate.ts'
+import { applyChromeSnapshotTool } from './tools/snapshot.ts'
+import { applyChromeClickTool } from './tools/click.ts'
+import { applyChromeScreenshotTool } from './tools/screenshot.ts'
+
+export { ChromeError } from './types.ts'
+export type {
+  ChromeErrorCode,
+  WaitUntil,
+  ScreenshotFormat,
+  MouseButton,
+} from './types.ts'
+export { ChromeRuntime, parseJsonString } from './service.ts'
+export type { ChromeRuntimeConfig } from './service.ts'
+export {
+  applyChromeNavigateTool,
+  applyChromeEvaluateTool,
+  applyChromeSnapshotTool,
+  applyChromeClickTool,
+  applyChromeScreenshotTool,
+} from './tools/index.ts'
+
+/** Default remote debugging port for a launched Chrome. */
+export const DEFAULT_CHROME_PORT = 9222
+
+/** Default cooperative per-operation timeout (ms). */
+export const DEFAULT_OPERATION_TIMEOUT_MS = 30_000
+
+/** Default quiet window before `networkidle*` is declared. */
+export const DEFAULT_NETWORK_IDLE_MS = 500
+
+/** Default cap on `chrome_snapshot` output characters. */
+export const DEFAULT_SNAPSHOT_MAX_CHARS = 200_000
+
+/** Cordis plugin name used by loader diagnostics. */
+export const name = 'chrome-tool'
+
+/** Services required before the tools register. */
+export const inject = ['tools', 'systemPrompt']
+
+/** Plugin configuration (every field has a schemastery default). */
+export interface Config {
+  /** Register `chrome_navigate`. Defaults to true. */
+  navigate?: boolean
+  /** Register `chrome_evaluate`. Defaults to true. */
+  evaluate?: boolean
+  /** Register `chrome_snapshot`. Defaults to true. */
+  snapshot?: boolean
+  /** Register `chrome_click`. Defaults to true. */
+  click?: boolean
+  /** Register `chrome_screenshot`. Defaults to true. */
+  screenshot?: boolean
+  /** Explicit Chrome executable path; omitted = discover. */
+  executablePath?: string
+  /** Launch a managed Chrome. False = attach to `cdpUrl`. Defaults to true. */
+  launch?: boolean
+  /** Existing CDP endpoint to attach to when `launch` is false (`ws://` or `http(s)://`). */
+  cdpUrl?: string
+  /** Remote debugging port for a launched Chrome. Defaults to 9222. */
+  port?: number
+  /** Host a launched Chrome binds its endpoint on. Defaults to 127.0.0.1. */
+  host?: string
+  /** Headless mode for a launched Chrome. Defaults to "new". */
+  headless?: boolean | 'new'
+  /** Persistent profile directory; fresh temp dir when omitted. */
+  userDataDir?: string
+  /** Extra raw Chrome CLI flags. */
+  extraArgs?: string[]
+  /** Per-operation timeout (ms). Defaults to 30000. */
+  operationTimeoutMs?: number
+  /** Quiet window before `networkidle*` is declared (ms). Defaults to 500. */
+  networkIdleMs?: number
+  /** Cap on `chrome_snapshot` output characters. Defaults to 200000. */
+  snapshotMaxChars?: number
+}
+
+export const Config: z<Config> = z.object({
+  navigate: z.boolean().default(true),
+  evaluate: z.boolean().default(true),
+  snapshot: z.boolean().default(true),
+  click: z.boolean().default(true),
+  screenshot: z.boolean().default(true),
+  executablePath: z.string(),
+  launch: z.boolean().default(true),
+  cdpUrl: z.string(),
+  port: z.number().default(DEFAULT_CHROME_PORT),
+  host: z.string().default('127.0.0.1'),
+  headless: z.union([z.boolean(), z.const('new')]).default('new'),
+  userDataDir: z.string(),
+  extraArgs: z.array(z.string()).default([]),
+  operationTimeoutMs: z.number().default(DEFAULT_OPERATION_TIMEOUT_MS),
+  networkIdleMs: z.number().default(DEFAULT_NETWORK_IDLE_MS),
+  snapshotMaxChars: z.number().default(DEFAULT_SNAPSHOT_MAX_CHARS),
+})
+
+/** Config with schemastery defaults applied. */
+type ResolvedConfig = {
+  navigate: boolean
+  evaluate: boolean
+  snapshot: boolean
+  click: boolean
+  screenshot: boolean
+  executablePath: string | undefined
+  launch: boolean
+  cdpUrl: string | undefined
+  port: number
+  host: string
+  headless: boolean | 'new'
+  userDataDir: string | undefined
+  extraArgs: string[]
+  operationTimeoutMs: number
+  networkIdleMs: number
+  snapshotMaxChars: number
+}
+
+/** Resolve the tool-family config into the service's runtime config. */
+function runtimeConfig(config: ResolvedConfig): ChromeRuntimeConfig {
+  return {
+    ...config.executablePath !== undefined && config.executablePath.length > 0 ? { executablePath: config.executablePath } : {},
+    launch: config.launch,
+    ...config.cdpUrl !== undefined && config.cdpUrl.length > 0 ? { cdpUrl: config.cdpUrl } : {},
+    port: config.port,
+    host: config.host,
+    headless: config.headless,
+    ...config.userDataDir !== undefined && config.userDataDir.length > 0 ? { userDataDir: config.userDataDir } : {},
+    extraArgs: config.extraArgs,
+    operationTimeoutMs: config.operationTimeoutMs,
+    networkIdleMs: config.networkIdleMs,
+  }
+}
+
+/** Validate that integer configs are positive. */
+function assertPositiveInteger(name: string, value: number): void {
+  if (!Number.isInteger(value) || value < 1) {
+    throw new Error(`dsh-chrome: ${name} must be a positive integer`)
+  }
+}
+
+/**
+ * Register the Chrome service and the enabled model-facing tools. Schemastery
+ * has already filled every defaulted field.
+ */
+export function apply(ctx: Context, config: Config): void {
+  const resolved = config as ResolvedConfig
+  assertPositiveInteger('port', resolved.port)
+  assertPositiveInteger('operationTimeoutMs', resolved.operationTimeoutMs)
+  assertPositiveInteger('networkIdleMs', resolved.networkIdleMs)
+  assertPositiveInteger('snapshotMaxChars', resolved.snapshotMaxChars)
+  if (!resolved.launch && (resolved.cdpUrl === undefined || resolved.cdpUrl.length === 0)) {
+    throw new Error('dsh-chrome: "cdpUrl" is required when "launch" is false')
+  }
+
+  const chrome = new ChromeRuntime(ctx, runtimeConfig(resolved))
+
+  ctx.systemPrompt.section({
+    name: 'chrome:overview',
+    order: 109,
+    text: 'The chrome_* tools drive a real Chrome browser over the DevTools Protocol. They can run arbitrary JavaScript, read rendered content, click elements, and capture screenshots in the controlled page. Treat them like shell access: they reach the network and run untrusted page code.',
+  })
+
+  if (resolved.navigate) applyChromeNavigateTool(ctx, chrome, resolved.operationTimeoutMs)
+  if (resolved.evaluate) applyChromeEvaluateTool(ctx, chrome, resolved.operationTimeoutMs)
+  if (resolved.snapshot) applyChromeSnapshotTool(ctx, chrome, resolved.operationTimeoutMs, resolved.snapshotMaxChars)
+  if (resolved.click) applyChromeClickTool(ctx, chrome, resolved.operationTimeoutMs)
+  if (resolved.screenshot) applyChromeScreenshotTool(ctx, chrome, resolved.operationTimeoutMs)
+}
