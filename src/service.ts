@@ -16,6 +16,16 @@ import { disposeChild, fetchVersionInfo, launchChrome, normalizeDebugEndpoint, t
 import { markdownExpression, type RawMarkdownSnapshot } from './markdown.ts'
 import { pageSnapshotExpression, type RawPageSnapshot } from './page-walker.ts'
 import {
+  Observatory,
+  DEFAULT_NET_BODY_MAX_CHARS,
+  DEFAULT_OBSERVATORY_MAX_ENTRIES,
+  formatActivityHint as formatActivityHintSafe,
+  type ConsoleLevel,
+  type ConsoleReadResult,
+  type NetEntry,
+  type NetListResult,
+} from './observatory.ts'
+import {
   ChromeError,
   computeCaptureScale,
   type CapturedScreenshot,
@@ -81,6 +91,10 @@ interface ActiveConnection {
   readonly launched?: LaunchedChrome
   /** Per-session network request tracker for `networkidle*` waits. */
   readonly network: NetworkState
+  /** Per-session activity ring buffers (network + console). */
+  readonly observatory: Observatory
+  /** What the model has already seen — the "since" cursors for auto-hints. */
+  readonly readCursors: { net: number; console: number }
   /**
    * Ref id to CSS selector from the most recent `pageSnapshot()`. Mutated in
    * place: navigation clears it, each snapshot replaces it wholesale.
@@ -94,6 +108,8 @@ interface ActiveConnection {
  */
 export class ChromeRuntime extends Service {
   private state: ConnectionState = { kind: 'idle' }
+  /** Ring-buffer capacity for new observatories; set by the plugin config. */
+  observatoryCapacity: number = DEFAULT_OBSERVATORY_MAX_ENTRIES
 
   constructor(ctx: Context, private readonly config: ChromeRuntimeConfig) {
     super(ctx, 'chrome')
@@ -195,30 +211,135 @@ export class ChromeRuntime extends Service {
     const sessionId = attached.sessionId
     const network: NetworkState = { inflight: new Set() }
     const pageRefs = new Map<string, string>()
+    const observatory = new Observatory(this.observatoryCapacity)
+    const readCursors = { net: 0, console: 0 }
     // Enable the domains the tools rely on; failures here are infrastructure errors.
     await client.send('Page.enable', undefined, { sessionId, signal })
     await client.send('Runtime.enable', undefined, { sessionId, signal })
     await client.send('Network.enable', undefined, { sessionId, signal })
-    this.trackNetwork(client, sessionId, network)
-    return { client, targetId, sessionId, launched, network, pageRefs }
+    // Browser-side log (CSP violations, failed loads); best-effort — old targets may refuse.
+    await client.send('Log.enable', undefined, { sessionId, signal }).catch(() => undefined)
+    this.trackNetwork(client, sessionId, network, observatory)
+    this.trackConsole(client, sessionId, observatory)
+    return { client, targetId, sessionId, launched, network, observatory, readCursors, pageRefs }
   }
 
-  /** Subscribe to Network events to maintain the `networkidle*` inflight set. */
-  private trackNetwork(client: CdpClient, sessionId: string, network: NetworkState): void {
-    const onRequest = (params: unknown): void => {
-      const requestId = (params as { requestId?: string }).requestId
+  /**
+   * Subscribe to Network events: keep the `networkidle*` inflight set and
+   * record every request into the observatory ring buffers.
+   */
+  private trackNetwork(client: CdpClient, sessionId: string, network: NetworkState, observatory: Observatory): void {
+    const inflight = (params: unknown): string | undefined => (params as { requestId?: string }).requestId
+    const onRequest = (raw: unknown): void => {
+      const params = raw as {
+        requestId?: string
+        request?: { url?: string; method?: string }
+        type?: string
+        redirectCount?: number
+        timestamp?: number
+        wallTime?: number
+      }
+      const requestId = inflight(raw)
       if (requestId === undefined) return
       network.inflight.add(requestId)
+      observatory.recordRequest({
+        requestId,
+        url: params.request?.url ?? '',
+        method: params.request?.method ?? 'GET',
+        timestamp: params.wallTime !== undefined ? params.wallTime * 1000 : params.timestamp !== undefined ? params.timestamp * 1000 : Date.now(),
+        ...params.type !== undefined ? { resourceType: params.type } : {},
+        ...params.redirectCount !== undefined ? { redirects: params.redirectCount } : {},
+      })
     }
-    const onDone = (params: unknown): void => {
-      const requestId = (params as { requestId?: string }).requestId
+    const onResponse = (raw: unknown): void => {
+      const params = raw as {
+        requestId?: string
+        type?: string
+        response?: { status?: number; mimeType?: string }
+      }
+      const requestId = inflight(raw)
+      if (requestId === undefined) return
+      network.inflight.delete(requestId)
+      observatory.recordResponse({
+        requestId,
+        ...params.response?.status !== undefined ? { status: params.response.status } : {},
+        ...params.response?.mimeType !== undefined ? { mimeType: params.response.mimeType } : {},
+        ...params.type !== undefined ? { resourceType: params.type } : {},
+      })
+    }
+    const onFinished = (raw: unknown): void => {
+      const requestId = inflight(raw)
       if (requestId === undefined) return
       network.inflight.delete(requestId)
     }
+    const onFailed = (raw: unknown): void => {
+      const params = raw as { requestId?: string; errorText?: string; canceled?: boolean }
+      const requestId = params.requestId
+      if (requestId === undefined) return
+      network.inflight.delete(requestId)
+      observatory.recordFailure({
+        requestId,
+        ...params.errorText !== undefined ? { errorText: params.errorText } : {},
+        ...params.canceled !== undefined ? { canceled: params.canceled } : {},
+      })
+    }
     client.on('Network.requestWillBeSent', onRequest)
-    client.on('Network.responseReceived', onDone)
-    client.on('Network.loadingFinished', onDone)
-    client.on('Network.loadingFailed', onDone)
+    client.on('Network.responseReceived', onResponse)
+    client.on('Network.loadingFinished', onFinished)
+    client.on('Network.loadingFailed', onFailed)
+    void sessionId
+  }
+
+  /** Subscribe to Runtime/Log events recording console output and exceptions. */
+  private trackConsole(client: CdpClient, sessionId: string, observatory: Observatory): void {
+    client.on('Runtime.consoleAPICalled', (raw: unknown) => {
+      const params = raw as {
+        type?: string
+        args?: unknown[]
+        timestamp?: number
+        stackTrace?: { callFrames?: Array<{ url?: string; lineNumber?: number }> }
+      }
+      if (params.type === undefined) return
+      const frame = params.stackTrace?.callFrames?.[0]
+      observatory.recordConsole({
+        type: params.type,
+        args: params.args ?? [],
+        timestamp: params.timestamp !== undefined ? params.timestamp * 1000 : Date.now(),
+        ...frame?.url !== undefined ? { url: frame.url } : {},
+        ...frame?.lineNumber !== undefined ? { lineNumber: frame.lineNumber } : {},
+      })
+    })
+    client.on('Runtime.exceptionThrown', (raw: unknown) => {
+      const params = raw as {
+        timestamp?: number
+        exceptionDetails?: {
+          text: string
+          exception?: { description?: string }
+          url?: string
+          lineNumber?: number
+        }
+      }
+      const details = params.exceptionDetails
+      if (details === undefined) return
+      observatory.recordException({
+        text: details.text,
+        ...details.exception?.description !== undefined ? { description: details.exception.description } : {},
+        timestamp: params.timestamp !== undefined ? params.timestamp * 1000 : Date.now(),
+        ...details.url !== undefined ? { url: details.url } : {},
+        ...details.lineNumber !== undefined ? { lineNumber: details.lineNumber } : {},
+      })
+    })
+    client.on('Log.entryAdded', (raw: unknown) => {
+      const entry = (raw as { entry?: { level?: string; text?: string; timestamp?: number; url?: string; lineNumber?: number } }).entry
+      if (entry?.text === undefined) return
+      observatory.recordBrowserLog({
+        level: entry.level ?? 'info',
+        text: entry.text,
+        timestamp: entry.timestamp !== undefined ? entry.timestamp * 1000 : Date.now(),
+        ...entry.url !== undefined ? { url: entry.url } : {},
+        ...entry.lineNumber !== undefined ? { lineNumber: entry.lineNumber } : {},
+      })
+    })
     void sessionId
   }
 
@@ -465,6 +586,95 @@ export class ChromeRuntime extends Service {
   async cdp(request: { method: string; params?: Record<string, unknown> }, signal?: AbortSignal): Promise<unknown> {
     const active = await this.ensure(signal)
     return active.client.send(request.method, request.params, { sessionId: active.sessionId, signal })
+  }
+
+  /**
+   * List captured network requests. Marks everything returned as "seen" for
+   * the auto-hint cursors, so follow-up calls only surface new activity.
+   */
+  async netList(options?: {
+    failedOnly?: boolean
+    maxEntries?: number
+    signal?: AbortSignal
+  }): Promise<NetListResult> {
+    const active = await this.ensure(options?.signal)
+    const result = active.observatory.netSince({
+      ...options?.failedOnly === true ? { failedOnly: true } : {},
+      ...options?.maxEntries !== undefined ? { maxEntries: options.maxEntries } : {},
+    })
+    const newest = result.entries[result.entries.length - 1]
+    if (newest !== undefined) active.readCursors.net = Math.max(active.readCursors.net, newest.seq + 1)
+    return result
+  }
+
+  /**
+   * Read one captured response body via `Network.getResponseBody`. Bodies are
+   * evicted by Chrome as loading proceeds, so a miss is reported as a
+   * recoverable hint rather than a hard failure.
+   */
+  async netBody(requestId: string, options?: { maxChars?: number; signal?: AbortSignal }): Promise<{ body: string; truncated: boolean; mimeType?: string; status?: number }> {
+    if (requestId.trim().length === 0) {
+      throw new ChromeError('netBody requires the requestId from chrome_net_list', 'CHROME_CDP_ERROR')
+    }
+    const active = await this.ensure(options?.signal)
+    const entry = active.observatory.netEntry(requestId)
+    let response: { body?: string; base64Encoded?: boolean }
+    try {
+      response = await active.client.send('Network.getResponseBody', { requestId }, {
+        sessionId: active.sessionId, signal: options?.signal,
+      }) as { body?: string; base64Encoded?: boolean }
+    } catch (error) {
+      throw new ChromeError(
+        `response body for ${requestId} is no longer available (Chrome evicts bodies as the page proceeds — list again and fetch promptly): ${(error as Error).message}`,
+        'CHROME_CDP_ERROR',
+        { cause: error },
+      )
+    }
+    if (typeof response.body !== 'string') {
+      throw new ChromeError(`response body for ${requestId} came back empty`, 'CHROME_CDP_ERROR')
+    }
+    const body = response.base64Encoded === true
+      ? Buffer.from(response.body, 'base64').toString('utf-8')
+      : response.body
+    const maxChars = options?.maxChars ?? DEFAULT_NET_BODY_MAX_CHARS
+    return {
+      body: body.slice(0, Math.max(0, maxChars)),
+      truncated: body.length > maxChars,
+      ...entry?.mimeType !== undefined ? { mimeType: entry.mimeType } : {},
+      ...entry?.status !== undefined ? { status: entry.status } : {},
+    }
+  }
+
+  /**
+   * Read console entries (console API output, uncaught exceptions, browser
+   * log). Advances the unread cursor over the returned entries; pass `all`
+   * to dump the entire buffer.
+   */
+  async consoleRead(options?: {
+    minLevel?: ConsoleLevel
+    maxEntries?: number
+    all?: boolean
+    signal?: AbortSignal
+  }): Promise<ConsoleReadResult> {
+    const active = await this.ensure(options?.signal)
+    const result = active.observatory.consoleSince({
+      ...options?.minLevel !== undefined ? { minLevel: options.minLevel } : {},
+      ...options?.all === true ? { all: true } : {},
+      ...options?.maxEntries !== undefined ? { maxEntries: options.maxEntries } : {},
+    }, active.readCursors.console)
+    active.readCursors.console = result.cursor
+    return result
+  }
+
+  /**
+   * One-line hint about unread page activity (console errors + failed
+   * requests) since the model last looked — appended to other tools' output.
+   * Does not touch the cursors.
+   */
+  activityHint(): string {
+    if (this.state.kind !== 'connected') return ''
+    const { observatory, readCursors } = this.state.active
+    return formatActivityHintSafe(observatory.unread(readCursors.net, readCursors.console))
   }
 
   /**

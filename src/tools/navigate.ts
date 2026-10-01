@@ -47,7 +47,7 @@ export function applyChromeNavigateTool(ctx: Context, chrome: ChromeRuntime, tim
         },
       },
       render: (_args, value): ContentBlock[] => [
-        { type: 'text', text: `Navigated to ${value.finalUrl}\nTitle: ${value.title || '(none)'}` },
+        { type: 'text', text: `Navigated to ${value.finalUrl}\nTitle: ${value.title || '(none)'}${chrome.activityHint()}` },
       ],
     },
     timeoutMs,

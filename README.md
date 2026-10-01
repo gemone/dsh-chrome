@@ -20,6 +20,18 @@ A [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) plugin tha
 | `chrome_type` | Type text via real keyboard events (`Input.insertText`), optionally focusing a selector/ref first. React/Vue/Angular-friendly. | `Input.insertText` |
 | `chrome_press_key` | Press a special key: Enter, Tab, Escape, arrows, F1–F12, etc. | `Input.dispatchKeyEvent` |
 | `chrome_close` | Close current tab (`Target.closeTarget`, browser stays alive) or entire browser (kill process). Auto-reconnects on next call. | `Target.closeTarget` / dispose |
+| `chrome_net_list` | List the network requests the page made since the session connected (URL, method, status, resource type, failures). `failedOnly: true` filters to failures. | `Network.*` events |
+| `chrome_net_body` | Read one captured response body by `requestId` (base64-decoded, bounded). Chrome evicts bodies as the page proceeds — fetch promptly. | `Network.getResponseBody` |
+| `chrome_console_read` | Read console output: `console.*` calls, uncaught exceptions, browser log entries (CSP, failed loads). `level` filters by severity (default `error`); `all: true` dumps the buffer. | `Runtime`/`Log` events |
+
+### Page-activity auto-hints
+
+The observatory (`src/observatory.ts`) ring-buffers network + console activity per
+session (500 entries per stream by default). Reading tools (`chrome_navigate`,
+`chrome_snapshot`, `chrome_page_snapshot`) append a `[page activity: …]` line
+when unread console errors or failed requests exist, so the model discovers
+page failures without polling. `chrome_console_read` / `chrome_net_list`
+advance the read cursors.
 
 Each tool registers a `systemPrompt.section` guidance entry and a UI card presenter.
 
@@ -203,6 +215,8 @@ src/
     ├── type.ts         chrome_type (Input.insertText, focus by selector/ref)
     ├── press-key.ts    chrome_press_key (Input.dispatchKeyEvent)
     ├── ref-target.ts   shared selector/ref argument resolution
+    ├── net.ts          chrome_net_list / chrome_net_body (Network events + getResponseBody)
+    ├── console.ts      chrome_console_read (Runtime/Log events)
     └── close.ts        chrome_close (Target.closeTarget / dispose)
 ```
 
@@ -215,7 +229,7 @@ src/
 
 ## Requirements
 
-- DeepSeek Harness `^0.1.7-rc.2` (attachment admission limits and message-source extensibility this plugin builds on)
+- DeepSeek Harness `^0.2.0-rc.2` (attachment admission limits and message-source extensibility this plugin builds on)
 - Chrome or Chromium on the host (or a reachable CDP endpoint)
 - Node ≥20
 

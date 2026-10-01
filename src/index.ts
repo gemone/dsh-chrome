@@ -20,6 +20,7 @@ import type { Context } from '@deepseek-ai/cordis'
 import z from '@deepseek-ai/schemastery'
 import { ChromeRuntime, type ChromeRuntimeConfig } from './service.ts'
 import { DEFAULT_PAGE_SNAPSHOT_MAX_NODES } from './page-walker.ts'
+import { DEFAULT_OBSERVATORY_MAX_ENTRIES } from './observatory.ts'
 import type { ScreenshotAnalysisRoute } from './analysis.ts'
 import { applyChromeNavigateTool } from './tools/navigate.ts'
 import { applyChromeEvaluateTool } from './tools/evaluate.ts'
@@ -31,6 +32,8 @@ import { applyChromeScrollTool } from './tools/scroll.ts'
 import { applyChromeTypeTool } from './tools/type.ts'
 import { applyChromePressKeyTool } from './tools/press-key.ts'
 import { applyChromeCloseTool } from './tools/close.ts'
+import { applyChromeNetTools } from './tools/net.ts'
+import { applyChromeConsoleTool } from './tools/console.ts'
 
 export { ChromeError, computeCaptureScale } from './types.ts'
 export type {
@@ -66,6 +69,8 @@ export {
   applyChromeTypeTool,
   applyChromePressKeyTool,
   applyChromeCloseTool,
+  applyChromeNetTools,
+  applyChromeConsoleTool,
 } from './tools/index.ts'
 
 /** Default remote debugging port for a launched Chrome. */
@@ -120,6 +125,12 @@ export interface Config {
   pressKey?: boolean
   /** Register `chrome_close`. Defaults to true. */
   close?: boolean
+  /** Register `chrome_net_list` / `chrome_net_body` (network observatory). Defaults to true. */
+  netLog?: boolean
+  /** Register `chrome_console_read` (console + exception capture). Defaults to true. */
+  consoleLog?: boolean
+  /** Ring-buffer capacity per observatory stream (network / console). Defaults to 500. */
+  observatoryMaxEntries?: number
   /** Explicit Chrome executable path; omitted = discover. */
   executablePath?: string
   /** Launch a managed Chrome. False = attach to `cdpUrl`. Defaults to true. */
@@ -159,6 +170,9 @@ export const Config: z<Config> = z.object({
   type: z.boolean().default(true),
   pressKey: z.boolean().default(true),
   close: z.boolean().default(true),
+  netLog: z.boolean().default(true),
+  consoleLog: z.boolean().default(true),
+  observatoryMaxEntries: z.number().default(DEFAULT_OBSERVATORY_MAX_ENTRIES),
   executablePath: z.string(),
   launch: z.boolean().default(true),
   cdpUrl: z.string(),
@@ -191,6 +205,9 @@ type ResolvedConfig = {
   type: boolean
   pressKey: boolean
   close: boolean
+  netLog: boolean
+  consoleLog: boolean
+  observatoryMaxEntries: number
   executablePath: string | undefined
   launch: boolean
   cdpUrl: string | undefined
@@ -263,6 +280,7 @@ export function apply(ctx: Context, config: Config): void {
   const analysisRoute = analysisRouteFrom(resolved.screenshotAnalysis)
 
   const chrome = new ChromeRuntime(ctx, runtimeConfig(resolved))
+  chrome.observatoryCapacity = resolved.observatoryMaxEntries
 
   ctx.systemPrompt.section({
     name: 'chrome:overview',
@@ -280,4 +298,6 @@ export function apply(ctx: Context, config: Config): void {
   if (resolved.type) applyChromeTypeTool(ctx, chrome, resolved.operationTimeoutMs)
   if (resolved.pressKey) applyChromePressKeyTool(ctx, chrome, resolved.operationTimeoutMs)
   if (resolved.close) applyChromeCloseTool(ctx, chrome, resolved.operationTimeoutMs)
+  if (resolved.netLog) applyChromeNetTools(ctx, chrome, resolved.operationTimeoutMs)
+  if (resolved.consoleLog) applyChromeConsoleTool(ctx, chrome, resolved.operationTimeoutMs)
 }

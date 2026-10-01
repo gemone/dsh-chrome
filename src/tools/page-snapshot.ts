@@ -44,7 +44,7 @@ export function applyChromePageSnapshotTool(ctx: Context, chrome: ChromeRuntime,
         },
       },
       render: (_args, value): ContentBlock[] => [
-        { type: 'text', text: formatPageSnapshot(value) },
+        { type: 'text', text: `${formatPageSnapshot(value)}${chrome.activityHint()}` },
       ],
     },
     timeoutMs,

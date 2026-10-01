@@ -5,7 +5,7 @@ import ToolRuntime from '@deepseek-ai/dsh-tools'
 import { apply, Config, name, inject } from '../src/index.ts'
 import { ChromeRuntime } from '../src/service.ts'
 
-const EXPECTED_TOOLS = ['chrome_navigate', 'chrome_evaluate', 'chrome_snapshot', 'chrome_page_snapshot', 'chrome_click', 'chrome_screenshot', 'chrome_scroll', 'chrome_type', 'chrome_press_key', 'chrome_close']
+const EXPECTED_TOOLS = ['chrome_navigate', 'chrome_evaluate', 'chrome_snapshot', 'chrome_page_snapshot', 'chrome_click', 'chrome_screenshot', 'chrome_scroll', 'chrome_type', 'chrome_press_key', 'chrome_close', 'chrome_net_list', 'chrome_net_body', 'chrome_console_read']
 
 async function setup() {
   const ctx = new Context()
@@ -44,7 +44,9 @@ describe('plugin integration with the DSH registries', () => {
     const sectionNames = assembly.sections.map(section => section.name)
     expect(sectionNames).toContain('chrome:overview')
     for (const tool of EXPECTED_TOOLS) {
-      expect(sectionNames).toContain(`tool:${tool}`)
+      // chrome_net_body shares the chrome_net_list prompt section.
+      const section = tool === 'chrome_net_body' ? 'chrome_net_list' : tool
+      expect(sectionNames).toContain(`tool:${section}`)
     }
   })
 
