@@ -6,7 +6,8 @@
 import type { Context } from '@deepseek-ai/cordis'
 import type { ContentBlock } from '@deepseek-ai/dsh-llm'
 import { defineTool } from '@deepseek-ai/dsh-tools'
-import type { GenericCallView, JsonValue } from '@deepseek-ai/dsh-tools'
+import type { GenericCallView } from '@deepseek-ai/dsh-tools'
+import type { JsonValue } from '@deepseek-ai/dsh-util-values'
 import type { ChromeRuntime } from '../service.ts'
 
 /** Canonical `chrome_evaluate` outcome. */
@@ -81,6 +82,12 @@ export function formatEvaluate(value: ChromeEvaluateValue): string {
   if (value.exceptionDetails !== undefined) {
     const desc = value.exceptionDetails.exception?.description
     return `<result type="exception">\n${value.exceptionDetails.text}${desc !== undefined ? `\n${desc}` : ''}\n</result>`
+  }
+  // `returnByValue` yields undefined for values JSON cannot carry (DOM nodes,
+  // functions); teach the model the JSON.stringify idiom instead of letting
+  // it conclude the page returned "null".
+  if (value.result === undefined) {
+    return '<result>\nnull\n</result>\n<hint>the expression returned undefined — DOM nodes, functions, and other non-JSON values serialize to undefined; wrap them inside the expression, e.g. `JSON.stringify(el.outerHTML)` or return plain data</hint>'
   }
   return `<result>\n${JSON.stringify(value.result, null, 2)}\n</result>`
 }

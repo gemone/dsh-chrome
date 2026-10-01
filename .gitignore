@@ -3,3 +3,5 @@ lib/
 *.tsbuildinfo
 coverage/
 .DS_Store
+.pnpm-store/
+pnpm-lock.yaml

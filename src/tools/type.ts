@@ -12,6 +12,8 @@ import { defineTool } from '@deepseek-ai/dsh-tools'
 import type { GenericCallView } from '@deepseek-ai/dsh-tools'
 import type { ChromeRuntime } from '../service.ts'
 import { ChromeError } from '../types.ts'
+import { normalizePageRef } from '../page-walker.ts'
+import { resolveRefSelector } from './ref-target.ts'
 
 /** Canonical `chrome_type` outcome. */
 export interface ChromeTypeValue {
@@ -25,15 +27,16 @@ export function applyChromeTypeTool(ctx: Context, chrome: ChromeRuntime, timeout
   ctx.systemPrompt.section({
     name: 'tool:chrome_type',
     order: 116,
-    text: 'Use the chrome_type tool to type text into a focused element via real keyboard events. It triggers native input events that React/Vue/Angular frameworks handle correctly. Prefer this over evaluate+setter for form input.',
+    text: 'Use the chrome_type tool to type text into a focused element via real keyboard events. Target the input by CSS selector or by a chrome_page_snapshot ref; with neither it types into whatever is focused. It triggers native input events that React/Vue/Angular frameworks handle correctly. Prefer this over evaluate+setter for form input.',
   })
 
   ctx.tools.register(defineTool({
     name: 'chrome_type',
-    description: 'Type text into a focused element using real keyboard events. Triggers native input events that frameworks handle correctly.',
+    description: 'Type text into a focused element using real keyboard events. Triggers native input events that frameworks handle correctly. Optionally focus a target first by CSS selector or chrome_page_snapshot ref.',
     parameters: {
       text: { type: 'string', required: true, description: 'The text to type.' },
-      selector: { type: 'string', description: 'CSS selector to focus before typing. If omitted, types into the currently focused element.' },
+      selector: { type: 'string', description: 'CSS selector to focus before typing. If omitted (with no ref), types into the currently focused element.' },
+      ref: { type: 'string', description: 'Element id from chrome_page_snapshot (e.g. "e12") to focus before typing. Takes precedence over "selector".' },
     },
     output: {
       schema: {
@@ -53,14 +56,23 @@ export function applyChromeTypeTool(ctx: Context, chrome: ChromeRuntime, timeout
     async execute(args, exec) {
       if (args.text.length === 0) throw new Error('text must be a non-empty string')
 
-      // Optionally focus a target element first.
-      if (args.selector) {
+      // Optionally focus a target element first (ref wins over selector).
+      let focusSelector: string | undefined
+      if (args.ref !== undefined && args.ref.trim().length > 0) {
+        focusSelector = resolveRefSelector(chrome, args.ref)
+      } else if (args.selector !== undefined && args.selector.trim().length > 0) {
+        focusSelector = args.selector
+      }
+      if (focusSelector !== undefined) {
         const focusResult = await chrome.evaluate(
-          `(() => { const el = document.querySelector(${JSON.stringify(args.selector)}); if (!el) return 'not_found'; el.focus(); return 'ok'; })()`,
+          `(() => { const el = document.querySelector(${JSON.stringify(focusSelector)}); if (!el) return 'not_found'; el.focus(); return 'ok'; })()`,
           { awaitPromise: false, returnByValue: true, signal: exec.signal },
         )
         if (focusResult.result === 'not_found') {
-          throw new ChromeError(`no element matched selector "${args.selector}"`, 'CHROME_CDP_ERROR')
+          const via = args.ref !== undefined && args.ref.trim().length > 0 && normalizePageRef(args.ref) !== undefined
+            ? `ref "${normalizePageRef(args.ref)}" (selector "${focusSelector}")`
+            : `selector "${focusSelector}"`
+          throw new ChromeError(`no element matched ${via}; take a fresh chrome_page_snapshot if the page has changed`, 'CHROME_CDP_ERROR')
         }
       }
 
@@ -76,12 +88,14 @@ export function applyChromeTypeTool(ctx: Context, chrome: ChromeRuntime, timeout
 
       return {
         typed: true,
-        ...args.selector !== undefined ? { selector: args.selector } : {},
+        ...focusSelector !== undefined ? { selector: focusSelector } : {},
         valueAfter: String(valueResult.result ?? ''),
       }
     },
     presentCall(args): GenericCallView {
-      const target = args.selector ?? 'focused element'
+      const target = args.ref !== undefined && args.ref.trim().length > 0
+        ? `ref ${args.ref.trim()}`
+        : args.selector ?? 'focused element'
       return { card: 'generic', title: `Type into ${target}`, kind: 'edit', rawInput: args.text }
     },
   }))

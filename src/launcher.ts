@@ -11,10 +11,10 @@
 import { spawn, type ChildProcess } from 'node:child_process'
 import { accessSync, constants } from 'node:fs'
 import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { delimiter, join } from 'node:path'
 import { ChromeError } from './types.ts'
 
-/** Common executable names searched on PATH (POSIX) when no explicit path is given. */
+/** Common executable names searched on PATH when no explicit path is given. */
 const PATH_CANDIDATES = ['google-chrome', 'google-chrome-stable', 'chromium', 'chromium-browser', 'chrome'] as const
 
 /** Well-known absolute install locations, checked in order. */
@@ -29,6 +29,21 @@ const WELL_KNOWN_LOCATIONS = [
   'C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe',
   'C:\\Program Files (x86)\\Google\\Chrome\\Application\\chrome.exe',
 ] as const
+
+/** How many bytes of child output the launch tail keeps for diagnostics. */
+const OUTPUT_TAIL_BYTES = 4096
+
+/**
+ * Rewrite `localhost` in a debug endpoint to `127.0.0.1`. Chrome ≥111 rejects
+ * DevTools HTTP requests whose `Host` header is not an IP or `localhost` is
+ * proxied, so always polling by loopback IP avoids the spurious 403.
+ *
+ * @param endpoint - `http(s)://host:port` base URL.
+ * @returns the endpoint with a literal loopback IP host.
+ */
+export function normalizeDebugEndpoint(endpoint: string): string {
+  return endpoint.includes('://localhost:') ? endpoint.replace('://localhost:', '://127.0.0.1:') : endpoint
+}
 
 /** Resolve `headless` config to the Chrome `--headless` flag value. */
 export function headlessFlag(headless: boolean | 'new'): string {
@@ -65,6 +80,8 @@ export function discoverExecutable(preferred?: string): string | undefined {
   const candidates = [
     preferred,
     process.env.DSH_CHROME_EXECUTABLE_PATH,
+    // Per-user Windows install (the machine-wide paths miss it).
+    process.env.LOCALAPPDATA !== undefined ? join(process.env.LOCALAPPDATA, 'Google', 'Chrome', 'Application', 'chrome.exe') : undefined,
     ...WELL_KNOWN_LOCATIONS,
   ]
   for (const candidate of candidates) {
@@ -72,16 +89,15 @@ export function discoverExecutable(preferred?: string): string | undefined {
       return candidate
     }
   }
-  // POSIX PATH lookup without spawning `which`/`where`: scan $PATH for a known basename.
-  if (process.platform !== 'win32') {
-    const pathEnv = process.env.PATH
-    if (pathEnv !== undefined && pathEnv.length > 0) {
-      for (const dir of pathEnv.split(':')) {
-        if (dir.length === 0) continue
-        for (const name of PATH_CANDIDATES) {
-          const candidate = join(dir, name)
-          if (isExecutable(candidate)) return candidate
-        }
+  // PATH lookup without spawning `which`/`where`: scan $PATH for a known
+  // basename, honoring the platform separator and Windows' `.exe` suffix.
+  const pathEnv = process.env.PATH
+  if (pathEnv !== undefined && pathEnv.length > 0) {
+    for (const dir of pathEnv.split(delimiter)) {
+      if (dir.length === 0) continue
+      for (const name of PATH_CANDIDATES) {
+        const candidate = join(dir, process.platform === 'win32' ? `${name}.exe` : name)
+        if (isExecutable(candidate)) return candidate
       }
     }
   }
@@ -106,10 +122,17 @@ export interface LaunchChromeOptions {
 
 /** A launched Chrome process plus its CDP discovery URL. */
 export interface LaunchedChrome {
-  /** `http(s)://host:port` base for `/json/version` discovery. */
+  /** `http(s)://host:port` base for `/json/version` discovery (loopback IP host). */
   readonly endpoint: string
   /** The spawned child process (absent in connect mode). */
   readonly child?: ChildProcess
+  /**
+   * The last few KB of combined child stdout/stderr. Chrome prints the real
+   * reason it cannot start (profile locked by another instance, sandbox or
+   * `/dev/shm` failures in containers, bad flags) here, so launch failures
+   * surface it instead of a bare exit code.
+   */
+  readonly recentOutput: () => string
 }
 
 /** Default per-launch temp profile directory. */
@@ -165,11 +188,25 @@ export function launchChrome(options: LaunchChromeOptions): LaunchedChrome {
   child.once('error', () => {
     // The polling loop below will reject; nothing to do here but avoid an unhandled error.
   })
-  // Detach stdio so the child cannot keep the parent event loop alive through inherited pipes.
-  child.stdout?.once('data', () => undefined)
-  child.stderr?.once('data', () => undefined)
+  // Keep a bounded tail of combined output for launch-failure diagnostics, and
+  // unref the pipes so they cannot keep the parent event loop alive.
+  let outputTail = ''
+  const append = (chunk: Buffer | string): void => {
+    outputTail = (outputTail + String(chunk)).slice(-OUTPUT_TAIL_BYTES)
+  }
+  child.stdout?.on('data', append)
+  child.stderr?.on('data', append)
+  // Typings model child pipes as plain Readables; the underlying handles do
+  // support unref, which stops them from keeping the parent loop alive.
+  for (const stream of [child.stdout, child.stderr]) {
+    (stream as unknown as { unref?: () => void } | null)?.unref?.()
+  }
 
-  return { endpoint: `http://${host}:${options.port}`, child }
+  return {
+    endpoint: normalizeDebugEndpoint(`http://${host}:${options.port}`),
+    child,
+    recentOutput: () => outputTail,
+  }
 }
 
 /** `/json/version` payload from a Chrome debugging endpoint. */

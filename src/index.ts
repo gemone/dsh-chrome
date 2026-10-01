@@ -6,7 +6,9 @@
  * The plugin registers a {@link ChromeRuntime} service as `ctx.chrome` (owning
  * the Chrome process and CDP connection lifecycle) and a family of
  * `defineTool` consumers over it: `chrome_navigate`, `chrome_evaluate`,
- * `chrome_snapshot`, `chrome_click`, and `chrome_screenshot`.
+ * `chrome_snapshot`, `chrome_page_snapshot`, `chrome_click`,
+ * `chrome_screenshot`, `chrome_scroll`, `chrome_type`, `chrome_press_key`,
+ * and `chrome_close`.
  *
  * Install into a profile with `dsh plugin --profile <name> add ./dsh-chrome`
  * (or `github:.../dsh-chrome`, a tarball, or the published package). See
@@ -17,9 +19,12 @@
 import type { Context } from '@deepseek-ai/cordis'
 import z from '@deepseek-ai/schemastery'
 import { ChromeRuntime, type ChromeRuntimeConfig } from './service.ts'
+import { DEFAULT_PAGE_SNAPSHOT_MAX_NODES } from './page-walker.ts'
+import type { ScreenshotAnalysisRoute } from './analysis.ts'
 import { applyChromeNavigateTool } from './tools/navigate.ts'
 import { applyChromeEvaluateTool } from './tools/evaluate.ts'
 import { applyChromeSnapshotTool } from './tools/snapshot.ts'
+import { applyChromePageSnapshotTool } from './tools/page-snapshot.ts'
 import { applyChromeClickTool } from './tools/click.ts'
 import { applyChromeScreenshotTool } from './tools/screenshot.ts'
 import { applyChromeScrollTool } from './tools/scroll.ts'
@@ -27,19 +32,34 @@ import { applyChromeTypeTool } from './tools/type.ts'
 import { applyChromePressKeyTool } from './tools/press-key.ts'
 import { applyChromeCloseTool } from './tools/close.ts'
 
-export { ChromeError } from './types.ts'
+export { ChromeError, computeCaptureScale } from './types.ts'
 export type {
   ChromeErrorCode,
   WaitUntil,
   ScreenshotFormat,
   MouseButton,
+  PageTreeSnapshotResult,
 } from './types.ts'
 export { ChromeRuntime, parseJsonString } from './service.ts'
 export type { ChromeRuntimeConfig } from './service.ts'
 export {
+  DEFAULT_PAGE_SNAPSHOT_MAX_NODES,
+  normalizePageRef,
+  pageSnapshotExpression,
+  formatPageSnapshot,
+} from './page-walker.ts'
+export type { ChromePageSnapshotValue, RawPageSnapshot } from './page-walker.ts'
+export {
+  DEFAULT_SCREENSHOT_ANALYSIS_PROMPT,
+  analyzeScreenshot,
+  assertAnalysisRouteAcceptsImages,
+} from './analysis.ts'
+export type { ScreenshotAnalysisRoute } from './analysis.ts'
+export {
   applyChromeNavigateTool,
   applyChromeEvaluateTool,
   applyChromeSnapshotTool,
+  applyChromePageSnapshotTool,
   applyChromeClickTool,
   applyChromeScreenshotTool,
   applyChromeScrollTool,
@@ -60,6 +80,18 @@ export const DEFAULT_NETWORK_IDLE_MS = 500
 /** Default cap on `chrome_snapshot` output characters. */
 export const DEFAULT_SNAPSHOT_MAX_CHARS = 200_000
 
+/** Raw shape of the optional `screenshotAnalysis` config section. */
+export interface ScreenshotAnalysisConfig {
+  /** Registered provider route owning the analysis model. */
+  provider?: string
+  /** Exact model id that accepts image input. */
+  model?: string
+  /** Base instruction for the analysis call; a sensible default when omitted. */
+  prompt?: string
+  /** Output cap for the analysis call. */
+  maxTokens?: number
+}
+
 /** Cordis plugin name used by loader diagnostics. */
 export const name = 'chrome-tool'
 
@@ -74,6 +106,8 @@ export interface Config {
   evaluate?: boolean
   /** Register `chrome_snapshot`. Defaults to true. */
   snapshot?: boolean
+  /** Register `chrome_page_snapshot` (structured element tree with refs). Defaults to true. */
+  pageSnapshot?: boolean
   /** Register `chrome_click`. Defaults to true. */
   click?: boolean
   /** Register `chrome_screenshot`. Defaults to true. */
@@ -108,12 +142,17 @@ export interface Config {
   networkIdleMs?: number
   /** Cap on `chrome_snapshot` output characters. Defaults to 200000. */
   snapshotMaxChars?: number
+  /** Cap on `chrome_page_snapshot` tree nodes. Defaults to 500. */
+  pageSnapshotMaxNodes?: number
+  /** Image-capable provider/model that describes screenshots on text-only routes. */
+  screenshotAnalysis?: ScreenshotAnalysisConfig
 }
 
 export const Config: z<Config> = z.object({
   navigate: z.boolean().default(true),
   evaluate: z.boolean().default(true),
   snapshot: z.boolean().default(true),
+  pageSnapshot: z.boolean().default(true),
   click: z.boolean().default(true),
   screenshot: z.boolean().default(true),
   scroll: z.boolean().default(true),
@@ -131,6 +170,13 @@ export const Config: z<Config> = z.object({
   operationTimeoutMs: z.number().default(DEFAULT_OPERATION_TIMEOUT_MS),
   networkIdleMs: z.number().default(DEFAULT_NETWORK_IDLE_MS),
   snapshotMaxChars: z.number().default(DEFAULT_SNAPSHOT_MAX_CHARS),
+  pageSnapshotMaxNodes: z.number().default(DEFAULT_PAGE_SNAPSHOT_MAX_NODES),
+  screenshotAnalysis: z.object({
+    provider: z.string(),
+    model: z.string(),
+    prompt: z.string(),
+    maxTokens: z.number(),
+  }),
 })
 
 /** Config with schemastery defaults applied. */
@@ -138,6 +184,7 @@ type ResolvedConfig = {
   navigate: boolean
   evaluate: boolean
   snapshot: boolean
+  pageSnapshot: boolean
   click: boolean
   screenshot: boolean
   scroll: boolean
@@ -155,6 +202,8 @@ type ResolvedConfig = {
   operationTimeoutMs: number
   networkIdleMs: number
   snapshotMaxChars: number
+  pageSnapshotMaxNodes: number
+  screenshotAnalysis: ScreenshotAnalysisConfig | undefined
 }
 
 /** Resolve the tool-family config into the service's runtime config. */
@@ -181,6 +230,23 @@ function assertPositiveInteger(name: string, value: number): void {
 }
 
 /**
+ * Normalize the raw `screenshotAnalysis` section (schemastery materializes an
+ * absent object as `{}`) into a route, rejecting partial configuration.
+ */
+function analysisRouteFrom(raw: ScreenshotAnalysisConfig | undefined): ScreenshotAnalysisRoute | undefined {
+  const provider = typeof raw?.provider === 'string' ? raw.provider.trim() : ''
+  const model = typeof raw?.model === 'string' ? raw.model.trim() : ''
+  if (provider.length === 0 && model.length === 0) return undefined
+  if (provider.length === 0 || model.length === 0) {
+    throw new Error('dsh-chrome: "screenshotAnalysis" requires both "provider" and "model" (an image-capable provider/model pair); remove the section to disable analysis')
+  }
+  const prompt = typeof raw?.prompt === 'string' && raw.prompt.trim().length > 0 ? raw.prompt : undefined
+  const maxTokens = typeof raw?.maxTokens === 'number' ? raw.maxTokens : undefined
+  if (maxTokens !== undefined) assertPositiveInteger('screenshotAnalysis.maxTokens', maxTokens)
+  return { provider, model, ...prompt !== undefined ? { prompt } : {}, ...maxTokens !== undefined ? { maxTokens } : {} }
+}
+
+/**
  * Register the Chrome service and the enabled model-facing tools. Schemastery
  * has already filled every defaulted field.
  */
@@ -190,23 +256,26 @@ export function apply(ctx: Context, config: Config): void {
   assertPositiveInteger('operationTimeoutMs', resolved.operationTimeoutMs)
   assertPositiveInteger('networkIdleMs', resolved.networkIdleMs)
   assertPositiveInteger('snapshotMaxChars', resolved.snapshotMaxChars)
+  assertPositiveInteger('pageSnapshotMaxNodes', resolved.pageSnapshotMaxNodes)
   if (!resolved.launch && (resolved.cdpUrl === undefined || resolved.cdpUrl.length === 0)) {
     throw new Error('dsh-chrome: "cdpUrl" is required when "launch" is false')
   }
+  const analysisRoute = analysisRouteFrom(resolved.screenshotAnalysis)
 
   const chrome = new ChromeRuntime(ctx, runtimeConfig(resolved))
 
   ctx.systemPrompt.section({
     name: 'chrome:overview',
     order: 109,
-    text: 'The chrome_* tools drive a real Chrome browser over the DevTools Protocol. They can run arbitrary JavaScript, read rendered content, click elements, and capture screenshots in the controlled page. Treat them like shell access: they reach the network and run untrusted page code.',
+    text: 'The chrome_* tools drive a real Chrome browser over the DevTools Protocol. They can run arbitrary JavaScript, read rendered content, click elements, and capture screenshots in the controlled page. Treat them like shell access: they reach the network and run untrusted page code. To understand a page, prefer chrome_page_snapshot (structured element tree with [ref=eN] ids you can act on) or chrome_snapshot (visible text); chrome_screenshot needs an image-capable route or a configured screenshotAnalysis model.',
   })
 
   if (resolved.navigate) applyChromeNavigateTool(ctx, chrome, resolved.operationTimeoutMs)
   if (resolved.evaluate) applyChromeEvaluateTool(ctx, chrome, resolved.operationTimeoutMs)
   if (resolved.snapshot) applyChromeSnapshotTool(ctx, chrome, resolved.operationTimeoutMs, resolved.snapshotMaxChars)
+  if (resolved.pageSnapshot) applyChromePageSnapshotTool(ctx, chrome, resolved.operationTimeoutMs, resolved.pageSnapshotMaxNodes)
   if (resolved.click) applyChromeClickTool(ctx, chrome, resolved.operationTimeoutMs)
-  if (resolved.screenshot) applyChromeScreenshotTool(ctx, chrome, resolved.operationTimeoutMs)
+  if (resolved.screenshot) applyChromeScreenshotTool(ctx, chrome, resolved.operationTimeoutMs, analysisRoute)
   if (resolved.scroll) applyChromeScrollTool(ctx, chrome, resolved.operationTimeoutMs)
   if (resolved.type) applyChromeTypeTool(ctx, chrome, resolved.operationTimeoutMs)
   if (resolved.pressKey) applyChromePressKeyTool(ctx, chrome, resolved.operationTimeoutMs)

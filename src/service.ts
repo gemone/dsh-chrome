@@ -12,13 +12,17 @@
 
 import { Context, Service } from '@deepseek-ai/cordis'
 import { CdpClient, createCdpClient } from './cdp.ts'
-import { disposeChild, fetchVersionInfo, launchChrome, type LaunchedChrome } from './launcher.ts'
+import { disposeChild, fetchVersionInfo, launchChrome, normalizeDebugEndpoint, type LaunchedChrome } from './launcher.ts'
+import { markdownExpression, type RawMarkdownSnapshot } from './markdown.ts'
+import { pageSnapshotExpression, type RawPageSnapshot } from './page-walker.ts'
 import {
   ChromeError,
+  computeCaptureScale,
   type CapturedScreenshot,
   type ClickResult,
   type EvaluationResult,
   type NavigationResult,
+  type PageTreeSnapshotResult,
   type SnapshotResult,
   type WaitUntil,
 } from './types.ts'
@@ -77,6 +81,11 @@ interface ActiveConnection {
   readonly launched?: LaunchedChrome
   /** Per-session network request tracker for `networkidle*` waits. */
   readonly network: NetworkState
+  /**
+   * Ref id to CSS selector from the most recent `pageSnapshot()`. Mutated in
+   * place: navigation clears it, each snapshot replaces it wholesale.
+   */
+  readonly pageRefs: Map<string, string>
 }
 
 /**
@@ -185,12 +194,13 @@ export class ChromeRuntime extends Service {
     const attached = await client.send('Target.attachToTarget', { targetId, flatten: true }, { signal }) as { sessionId: string }
     const sessionId = attached.sessionId
     const network: NetworkState = { inflight: new Set() }
+    const pageRefs = new Map<string, string>()
     // Enable the domains the tools rely on; failures here are infrastructure errors.
     await client.send('Page.enable', undefined, { sessionId, signal })
     await client.send('Runtime.enable', undefined, { sessionId, signal })
     await client.send('Network.enable', undefined, { sessionId, signal })
     this.trackNetwork(client, sessionId, network)
-    return { client, targetId, sessionId, launched, network }
+    return { client, targetId, sessionId, launched, network, pageRefs }
   }
 
   /** Subscribe to Network events to maintain the `networkidle*` inflight set. */
@@ -226,13 +236,25 @@ export class ChromeRuntime extends Service {
     }
     if (nav.errorText !== undefined) {
       waiter.cancel()
-      throw new ChromeError(`navigation to ${url} failed: ${nav.errorText}`, 'CHROME_CDP_ERROR')
+      throw new ChromeError(`navigation to ${url} failed: ${nav.errorText} (verify the URL resolves from the machine running Chrome)`, 'CHROME_CDP_ERROR')
     }
     try {
       await waiter.wait(this.config.operationTimeoutMs, signal)
+    } catch (error) {
+      if (error instanceof ChromeError && error.code === 'CHROME_TIMEOUT') {
+        throw new ChromeError(
+          `navigation to ${url} timed out after ${this.config.operationTimeoutMs} ms waiting for "${waitUntil}"; `
+          + 'networkidle* waits never settle on pages with long-polling or streaming connections — prefer "load" or "domcontentloaded", or raise operationTimeoutMs',
+          'CHROME_TIMEOUT',
+          { cause: error },
+        )
+      }
+      throw error
     } finally {
       waiter.dispose()
     }
+    // A new document invalidates every ref from the previous page snapshot.
+    active.pageRefs.clear()
     const meta = await this.evaluate(`JSON.stringify({ url: location.href, title: document.title })`, { signal })
     const parsed = parseJsonString(meta.result) as { url: string; title: string } | undefined
     return {
@@ -261,16 +283,24 @@ export class ChromeRuntime extends Service {
     }
   }
 
-  /** Capture a screenshot as decoded bytes plus its verified media type. */
+  /**
+   * Capture a screenshot as decoded bytes plus its verified media type. When
+   * `limits` are given and the page exceeds them (DSH 0.1.7's attachment
+   * admission refuses images over `maxDimension` per side or `maxPixels`
+   * total), the capture is scaled down via a CDP clip instead of being
+   * refused at commit time.
+   */
   async screenshot(options: {
     format?: 'png' | 'jpeg' | 'webp'
     quality?: number
     fullPage?: boolean
     signal?: AbortSignal
+    limits?: { readonly maxDimension?: number; readonly maxPixels?: number }
   }): Promise<CapturedScreenshot> {
     const format = options.format ?? 'png'
     const active = await this.ensure(options?.signal)
-    if (options.fullPage ?? true) {
+    const fullPage = options.fullPage ?? true
+    if (fullPage) {
       await active.client.send('Emulation.setDeviceMetricsOverride', {
         width: 1280,
         height: 800,
@@ -278,44 +308,145 @@ export class ChromeRuntime extends Service {
         mobile: false,
       }, { sessionId: active.sessionId, signal: options?.signal }).catch(() => undefined)
     }
-    const response = await active.client.send('Page.captureScreenshot', {
+
+    // Measure the page and scale the capture into the admission budget.
+    let scale: number | undefined
+    let sourceWidth: number | undefined
+    let sourceHeight: number | undefined
+    let clip: { x: number; y: number; width: number; height: number; scale: number } | undefined
+    if (fullPage && options.limits !== undefined) {
+      const metrics = await active.client.send('Page.getLayoutMetrics', undefined, {
+        sessionId: active.sessionId, signal: options?.signal,
+      }).catch(() => undefined) as { cssContentSize?: { width: number; height: number } } | undefined
+      const size = metrics?.cssContentSize
+      if (size !== undefined && size.width > 0 && size.height > 0) {
+        sourceWidth = size.width
+        sourceHeight = size.height
+        const computed = computeCaptureScale(size.width, size.height, options.limits)
+        if (computed < 1) {
+          scale = computed
+          // The clip covers the full page in CSS pixels; `scale` shrinks the
+          // produced raster, exactly like DevTools' "capture node screenshot".
+          clip = { x: 0, y: 0, width: size.width, height: size.height, scale: computed }
+        }
+      }
+    }
+
+    const params: Record<string, unknown> = {
       format,
       ...format === 'jpeg' && options.quality !== undefined ? { quality: options.quality } : {},
-      captureBeyondViewport: options.fullPage ?? true,
-    }, { sessionId: active.sessionId, signal: options?.signal }) as { data?: string }
+      captureBeyondViewport: fullPage || clip !== undefined,
+      ...clip !== undefined ? { clip } : {},
+    }
+    const response = await active.client.send('Page.captureScreenshot', params, {
+      sessionId: active.sessionId, signal: options?.signal,
+    }) as { data?: string }
     if (typeof response.data !== 'string' || response.data.length === 0) {
       throw new ChromeError('Page.captureScreenshot returned no image data', 'CHROME_CDP_ERROR')
     }
     const data = Buffer.from(response.data, 'base64')
-    return { data: new Uint8Array(data), mediaType: `image/${format}` as CapturedScreenshot['mediaType'] }
+    return {
+      data: new Uint8Array(data),
+      mediaType: `image/${format}` as CapturedScreenshot['mediaType'],
+      ...sourceWidth !== undefined ? { sourceWidth } : {},
+      ...sourceHeight !== undefined ? { sourceHeight } : {},
+      ...scale !== undefined ? { scale } : {},
+    }
   }
 
   /** Read bounded visible page text plus url/title. */
   async snapshot(maxChars: number, signal?: AbortSignal): Promise<SnapshotResult> {
     const active = await this.ensure(signal)
-    const expression = `(() => { const t = document.body && document.body.innerText ? document.body.innerText : ''; return JSON.stringify({ url: location.href, title: document.title, text: t.slice(0, ${Math.max(0, Math.floor(maxChars))}), truncated: t.length > ${Math.max(0, Math.floor(maxChars))} }); })()`
+    const expression = `(() => { const t = document.body && document.body.innerText ? document.body.innerText : ''; return JSON.stringify({ url: location.href, title: document.title, readyState: document.readyState, text: t.slice(0, ${Math.max(0, Math.floor(maxChars))}), truncated: t.length > ${Math.max(0, Math.floor(maxChars))} }); })()`
     const evaluation = await active.client.send('Runtime.evaluate', {
       expression,
       awaitPromise: false,
       returnByValue: true,
     }, { sessionId: active.sessionId, signal }) as { result?: { value?: string } }
-    const parsed = parseJsonString(evaluation.result?.value) as { url: string; title: string; text: string; truncated: boolean } | undefined
+    const parsed = parseJsonString(evaluation.result?.value) as { url: string; title: string; readyState?: string; text: string; truncated: boolean } | undefined
     if (parsed === undefined) {
-      return { url: '', title: '', text: '', truncated: false }
+      return { url: '', title: '', readyState: '', text: '', truncated: false }
     }
-    return { url: parsed.url, title: parsed.title, text: parsed.text, truncated: parsed.truncated }
+    return { url: parsed.url, title: parsed.title, readyState: parsed.readyState ?? '', text: parsed.text, truncated: parsed.truncated }
+  }
+
+  /** Read the page converted to bounded GitHub-flavored Markdown. */
+  async markdown(maxChars: number, signal?: AbortSignal): Promise<SnapshotResult> {
+    const active = await this.ensure(signal)
+    const evaluation = await active.client.send('Runtime.evaluate', {
+      expression: markdownExpression(maxChars),
+      awaitPromise: false,
+      returnByValue: true,
+    }, { sessionId: active.sessionId, signal }) as { result?: { value?: string } }
+    const parsed = parseJsonString(evaluation.result?.value) as RawMarkdownSnapshot | undefined
+    if (parsed === undefined || typeof parsed.markdown !== 'string') {
+      return { url: '', title: '', readyState: '', text: '', truncated: false }
+    }
+    return { url: parsed.url, title: parsed.title, readyState: parsed.readyState ?? '', text: parsed.markdown, truncated: parsed.truncated }
+  }
+
+  /**
+   * Capture one structured (use-browser style) page snapshot: an element tree
+   * with `[ref=eN]` ids plus the ref-to-selector map this runtime keeps for
+   * `chrome_click` / `chrome_type` / `chrome_scroll`. The map replaces any
+   * previous one; navigation clears it.
+   */
+  async pageSnapshot(maxNodes: number, signal?: AbortSignal): Promise<PageTreeSnapshotResult> {
+    const active = await this.ensure(signal)
+    const evaluation = await active.client.send('Runtime.evaluate', {
+      expression: pageSnapshotExpression(maxNodes),
+      awaitPromise: false,
+      returnByValue: true,
+    }, { sessionId: active.sessionId, signal }) as { result?: { value?: string } }
+    const parsed = parseJsonString(evaluation.result?.value) as RawPageSnapshot | undefined
+    if (parsed === undefined || typeof parsed.tree !== 'string') {
+      throw new ChromeError(
+        'the page returned no structured snapshot (no document body, a non-HTML document, or the page is still loading)',
+        'CHROME_CDP_ERROR',
+      )
+    }
+    const refs = new Map<string, string>()
+    const raw = parsed.refs ?? {}
+    for (const ref of Object.keys(raw)) {
+      const selector = raw[ref]
+      if (typeof selector === 'string' && selector.length > 0) refs.set(ref, selector)
+    }
+    active.pageRefs.clear()
+    for (const [ref, selector] of refs) active.pageRefs.set(ref, selector)
+    return {
+      url: parsed.url,
+      title: parsed.title,
+      readyState: parsed.readyState,
+      tree: parsed.tree,
+      refCount: refs.size,
+      truncated: parsed.truncated === true,
+    }
+  }
+
+  /** Resolve one `[ref=eN]` id to the CSS selector captured with it. */
+  resolvePageRef(ref: string): string | undefined {
+    if (this.state.kind !== 'connected') return undefined
+    return this.state.active.pageRefs.get(ref)
+  }
+
+  /** How many refs from the latest `pageSnapshot()` are currently actionable. */
+  get registeredPageRefCount(): number {
+    return this.state.kind === 'connected' ? this.state.active.pageRefs.size : 0
   }
 
   /** Click the center of the first element matching a CSS selector. */
   async click(selector: string, button: 'left' | 'right' | 'middle', signal?: AbortSignal): Promise<ClickResult> {
     const active = await this.ensure(signal)
-    const expression = `(() => { const el = document.querySelector(${JSON.stringify(selector)}); if (!el) return JSON.stringify(null); el.scrollIntoView({ block: 'center', inline: 'center' }); const r = el.getBoundingClientRect(); return JSON.stringify({ x: r.x + r.width / 2, y: r.y + r.height / 2 }); })()`
+    // Resolve the center and, in the same script, check what actually sits on
+    // top of that point — a cookie banner or fixed header intercepting the
+    // click is the classic "clicked but nothing happened" failure.
+    const expression = `(() => { const el = document.querySelector(${JSON.stringify(selector)}); if (!el) return JSON.stringify(null); el.scrollIntoView({ block: 'center', inline: 'center' }); const r = el.getBoundingClientRect(); const x = r.x + r.width / 2, y = r.y + r.height / 2; let coveredBy = null; const top = document.elementFromPoint(x, y); if (top && top !== el && !el.contains(top) && !top.contains(el)) { let desc = top.tagName.toLowerCase(); if (top.id) desc += '#' + top.id; else if (typeof top.className === 'string' && top.className.trim()) desc += '.' + top.className.trim().split(/\\s+/).slice(0, 3).join('.'); coveredBy = desc; } return JSON.stringify({ x, y, coveredBy }); })()`
     const evaluation = await active.client.send('Runtime.evaluate', {
       expression,
       awaitPromise: false,
       returnByValue: true,
     }, { sessionId: active.sessionId, signal }) as { result?: { value?: string } }
-    const center = parseJsonString(evaluation.result?.value) as { x: number; y: number } | null
+    const center = parseJsonString(evaluation.result?.value) as { x: number; y: number; coveredBy: string | null } | null
     if (center === null) {
       return { clicked: false, selector }
     }
@@ -323,7 +454,11 @@ export class ChromeRuntime extends Service {
     await active.client.send('Input.dispatchMouseEvent', { type: 'mouseMoved', x: center.x, y: center.y }, { sessionId: active.sessionId, signal })
     await active.client.send('Input.dispatchMouseEvent', { type: 'mousePressed', x: center.x, y: center.y, button: cdpButton, clickCount: 1 }, { sessionId: active.sessionId, signal })
     await active.client.send('Input.dispatchMouseEvent', { type: 'mouseReleased', x: center.x, y: center.y, button: cdpButton, clickCount: 1 }, { sessionId: active.sessionId, signal })
-    return { clicked: true, selector }
+    return {
+      clicked: true,
+      selector,
+      ...center.coveredBy !== null ? { coveredBy: center.coveredBy } : {},
+    }
   }
 
   /** Low-level CDP method passthrough on the page session (power-user escape hatch). */
@@ -502,7 +637,9 @@ export function parseJsonString(value: unknown): unknown | undefined {
 /** Resolve a browser-level `webSocketDebuggerUrl` from a `ws://` or `http(s)://` endpoint. */
 async function resolveBrowserWsUrl(endpoint: string, signal?: AbortSignal): Promise<string> {
   if (endpoint.startsWith('ws://') || endpoint.startsWith('wss://')) return endpoint
-  const version = await fetchVersionInfo(endpoint.replace(/\/$/, ''), signal)
+  // Chrome ≥111 rejects DevTools HTTP requests whose Host header is not an
+  // IP; a `localhost` cdpUrl (especially behind a proxy) trips this, so poll by IP.
+  const version = await fetchVersionInfo(normalizeDebugEndpoint(endpoint.replace(/\/$/, '')), signal)
   return version.webSocketDebuggerUrl
 }
 
@@ -511,10 +648,27 @@ async function waitForReady(endpoint: string, timeoutMs: number, signal: AbortSi
   const retries = Math.max(5, Math.floor(timeoutMs / 100))
   const exited = launched.child !== undefined
     ? new Promise<never>((_, reject) => {
-      launched.child!.once('exit', code => reject(new ChromeError(
-        `Chrome exited before its debugging endpoint opened (exit code ${code})`,
-        'CHROME_LAUNCH_FAILED',
-      )))
+      launched.child!.once('exit', code => {
+        // Chrome prints the real reason it cannot start (profile locked by
+        // another instance, sandbox or /dev/shm failure in containers, a bad
+        // flag) to stderr. Node can emit 'exit' before the stdio streams
+        // deliver their final chunks, so drain briefly before reading the tail.
+        setTimeout(() => {
+          const output = launched.recentOutput().trim()
+          let hint = ''
+          if (output.includes('SingletonLock') || output.includes('SingletonSocket')) {
+            hint = '; another Chrome is already using this userDataDir — give the plugin its own profile directory'
+          } else if (output.includes('sandbox') || output.includes('Failed to move to new namespace')) {
+            hint = '; running in a container? add ["--no-sandbox", "--disable-dev-shm-usage"] to extraArgs'
+          }
+          reject(new ChromeError(
+            `Chrome exited before its debugging endpoint opened (exit code ${code})`
+            + (output.length > 0 ? `; last output: ${output.slice(-800)}` : '')
+            + hint,
+            'CHROME_LAUNCH_FAILED',
+          ))
+        }, 80)
+      })
     })
     : new Promise<never>(() => undefined)
   return await Promise.race([

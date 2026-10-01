@@ -5,7 +5,7 @@ import ToolRuntime from '@deepseek-ai/dsh-tools'
 import { apply, Config, name, inject } from '../src/index.ts'
 import { ChromeRuntime } from '../src/service.ts'
 
-const EXPECTED_TOOLS = ['chrome_navigate', 'chrome_evaluate', 'chrome_snapshot', 'chrome_click', 'chrome_screenshot', 'chrome_scroll', 'chrome_type', 'chrome_press_key', 'chrome_close']
+const EXPECTED_TOOLS = ['chrome_navigate', 'chrome_evaluate', 'chrome_snapshot', 'chrome_page_snapshot', 'chrome_click', 'chrome_screenshot', 'chrome_scroll', 'chrome_type', 'chrome_press_key', 'chrome_close']
 
 async function setup() {
   const ctx = new Context()
@@ -50,11 +50,11 @@ describe('plugin integration with the DSH registries', () => {
 
   it('respects per-tool enable flags', async () => {
     const ctx = await setup()
-    apply(ctx, Config({ navigate: true, evaluate: false, snapshot: false, click: false, screenshot: false }))
+    apply(ctx, Config({ navigate: true, evaluate: false, snapshot: false, click: false, screenshot: false, pageSnapshot: false }))
 
     const names = ctx.tools.schemas().map(schema => schema.name)
     expect(names).toContain('chrome_navigate')
-    for (const disabled of ['chrome_evaluate', 'chrome_snapshot', 'chrome_click', 'chrome_screenshot']) {
+    for (const disabled of ['chrome_evaluate', 'chrome_snapshot', 'chrome_page_snapshot', 'chrome_click', 'chrome_screenshot']) {
       expect(names).not.toContain(disabled)
     }
   })
@@ -62,6 +62,16 @@ describe('plugin integration with the DSH registries', () => {
   it('rejects connect mode without a cdpUrl', async () => {
     const ctx = await setup()
     expect(() => apply(ctx, Config({ launch: false }))).toThrow(/cdpUrl/)
+  })
+
+  it('rejects a partially configured screenshotAnalysis section', async () => {
+    const ctx = await setup()
+    expect(() => apply(ctx, Config({ screenshotAnalysis: { provider: 'openai' } }))).toThrow(/screenshotAnalysis.*provider.*model/)
+  })
+
+  it('accepts a fully configured screenshotAnalysis section', async () => {
+    const ctx = await setup()
+    expect(() => apply(ctx, Config({ screenshotAnalysis: { provider: 'openai', model: 'gpt-4o-mini' } }))).not.toThrow()
   })
 
   it('unregisters on dispose', async () => {
