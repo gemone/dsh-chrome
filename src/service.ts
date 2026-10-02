@@ -722,6 +722,11 @@ export class ChromeRuntime extends Service {
       resolve = res
       reject = rej
     })
+    // cancel() rejects this promise on error paths where the caller never
+    // awaits it (send failure, errorText) — attach a no-op handler so the
+    // rejection never surfaces as an unhandledRejection fatal, while real
+    // consumers still receive it through raceWithTimeout.
+    promise.catch(() => undefined)
     const offDom = client.on('Page.domContentEventFired', () => {
       if (waitUntil === 'domcontentloaded') resolve()
     })

@@ -87,3 +87,42 @@ describe('plugin integration with the DSH registries', () => {
     }
   })
 })
+
+describe('navigate error paths do not leak unhandled rejections', () => {
+  /** A connection stub whose Page.navigate send always fails. */
+  function failingConnection(): Record<string, unknown> {
+    return {
+      client: {
+        send: (method: string) => {
+          if (method === 'Page.navigate') throw new Error('CDP socket is closed')
+          return Promise.resolve({})
+        },
+        on: () => () => undefined,
+      },
+      sessionId: 's',
+      network: { inflight: new Set() },
+      observatory: { netSince: () => ({ entries: [], total: 0, dropped: 0, truncated: false }) },
+      readCursors: { net: 0, console: 0 },
+      pageRefs: new Map(),
+    }
+  }
+
+  it('cancel-on-send-failure stays handled (regression: fatal unhandled rejection)', async () => {
+    const ctx = await setup()
+    apply(ctx, Config({}))
+    const chrome = ctx.chrome
+    ;(chrome as unknown as { ensure: () => Promise<unknown> }).ensure = () => Promise.resolve(failingConnection())
+
+    const unhandled: unknown[] = []
+    const onUnhandled = (reason: unknown): void => { unhandled.push(reason) }
+    process.on('unhandledRejection', onUnhandled)
+    try {
+      await expect(chrome.navigate('https://example.com/', 'load')).rejects.toThrow('CDP socket is closed')
+      // Let microtasks (and any leaked rejection) settle.
+      await new Promise(resolve => setTimeout(resolve, 20))
+      expect(unhandled).toEqual([])
+    } finally {
+      process.off('unhandledRejection', onUnhandled)
+    }
+  })
+})
