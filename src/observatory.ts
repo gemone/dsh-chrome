@@ -430,8 +430,9 @@ export function formatConsoleRead(result: ConsoleReadResult): string {
     + (result.dropped > 0 ? ` — ${result.dropped} oldest evicted` : '')
     + '\n\n'
   const lines = result.entries.map(entry => {
-    const loc = entry.url !== undefined
-      ? ` @ ${entry.url}${entry.lineNumber !== undefined ? `:${entry.lineNumber}` : ''}`
+    const url = entry.url !== undefined && entry.url.length > 0 ? entry.url : undefined
+    const loc = url !== undefined
+      ? ` @ ${url}${entry.lineNumber !== undefined ? `:${entry.lineNumber}` : ''}`
       : ''
     return `[${entry.index}] ${entry.level.toUpperCase()} (${entry.source})${loc}: ${entry.text}`
   })
