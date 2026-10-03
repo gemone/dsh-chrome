@@ -389,11 +389,15 @@ export function serializeConsoleArgs(args: readonly unknown[]): string {
 
 /** Render one net entry as a compact model-facing line. Pure. */
 export function formatNetEntry(entry: NetEntry): string {
+  const status = entry.status !== undefined
+    ? String(entry.status)
+    : entry.failed ? 'FAILED' : '…'
   const parts = [
     entry.method,
-    `${entry.status ?? (entry.failed ? 'FAILED' : '…')}`,
+    status,
     entry.resourceType ?? '',
     entry.url,
+    `(requestId: ${entry.requestId})`,
   ].filter(part => part.length > 0)
   let line = parts.join(' ')
   if (entry.errorText !== undefined) line += ` — ${entry.errorText}`

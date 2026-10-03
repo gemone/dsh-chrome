@@ -185,6 +185,7 @@ describe('formatting', () => {
     obs.recordFailure({ requestId: 'bad', errorText: 'net::ERR_FAILED' })
     const text = formatNetList(obs.netSince({ failedOnly: true }), true)
     expect(text).toContain('POST FAILED')
+    expect(text).toContain('(requestId: bad)')
     expect(text).toContain('net::ERR_FAILED')
     expect(text).toContain('chrome_net_body')
     expect(formatNetList(obs.netSince({ since: 10_000 }), false)).toContain('No network requests recorded')
