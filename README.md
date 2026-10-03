@@ -23,6 +23,8 @@ A [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) plugin tha
 | `chrome_net_list` | List the network requests the page made since the session connected (URL, method, status, resource type, failures). `failedOnly: true` filters to failures. | `Network.*` events |
 | `chrome_net_body` | Read one captured response body by `requestId` (base64-decoded, bounded). Chrome evicts bodies as the page proceeds — fetch promptly. | `Network.getResponseBody` |
 | `chrome_console_read` | Read console output: `console.*` calls, uncaught exceptions, browser log entries (CSP, failed loads). `level` filters by severity (default `error`); `all: true` dumps the buffer. | `Runtime`/`Log` events |
+| `chrome_emulate` | Override the page environment: viewport/DPR/mobile, network throttling (`offline`/`slow3G`/`fast3G`/`none`), CPU throttling, geolocation, timezone, locale, user-agent. `clear: true` resets first. | `Emulation`/`Network` |
+| `chrome_pdf` | Print the page to a PDF file at an absolute path (landscape, printBackground, paperFormat, scale, pageRanges). | `Page.printToPDF` |
 
 ### Page-activity auto-hints
 

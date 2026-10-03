@@ -11,7 +11,10 @@
  */
 
 import { Context, Service } from '@deepseek-ai/cordis'
+import fs from 'node:fs/promises'
+import { dirname } from 'node:path'
 import { CdpClient, createCdpClient } from './cdp.ts'
+import { networkConditions } from './emulation.ts'
 import { disposeChild, fetchVersionInfo, launchChrome, normalizeDebugEndpoint, type LaunchedChrome } from './launcher.ts'
 import { markdownExpression, type RawMarkdownSnapshot } from './markdown.ts'
 import { pageSnapshotExpression, type RawPageSnapshot } from './page-walker.ts'
@@ -689,6 +692,110 @@ export class ChromeRuntime extends Service {
       if (active.network.timer !== undefined) clearTimeout(active.network.timer)
       this.state = { kind: 'connected-browser', client: active.client, launched: active.launched }
     }
+  }
+
+  /**
+   * Apply environment overrides. Every field is independent; omitted fields
+   * are left untouched. `clear: true` first resets device metrics,
+   * geolocation, and network conditions to defaults (later fields in the same
+   * call still apply). Returns the CDP actions performed.
+   */
+  async emulate(options: {
+    clear?: boolean
+    width?: number
+    height?: number
+    deviceScaleFactor?: number
+    mobile?: boolean
+    network?: 'none' | 'offline' | 'slow3G' | 'fast3G'
+    cpuThrottlingRate?: number
+    latitude?: number
+    longitude?: number
+    accuracy?: number
+    timezoneId?: string
+    locale?: string
+    userAgent?: string
+    signal?: AbortSignal
+  }): Promise<{ applied: readonly string[] }> {
+    const active = await this.ensure(options.signal)
+    const { client, sessionId } = active
+    const signal = options.signal
+    const applied: string[] = []
+    const send = async (method: string, params?: Record<string, unknown>): Promise<void> => {
+      await client.send(method, params, { sessionId, signal })
+      applied.push(params === undefined ? method : `${method} ${JSON.stringify(params)}`)
+    }
+    if (options.clear === true) {
+      await send('Emulation.clearDeviceMetricsOverride')
+      await send('Emulation.clearGeolocationOverride')
+      await send('Emulation.setTimezoneOverride', { timezoneId: '' })
+      await send('Network.emulateNetworkConditions', { offline: false, latency: 0, downloadThroughput: -1, uploadThroughput: -1 })
+      await send('Emulation.setCPUThrottlingRate', { rate: 1 })
+      await send('Emulation.setUserAgentOverride', { userAgent: '' })
+    }
+    if (options.width !== undefined || options.height !== undefined || options.deviceScaleFactor !== undefined || options.mobile !== undefined) {
+      await send('Emulation.setDeviceMetricsOverride', {
+        width: options.width ?? 0,
+        height: options.height ?? 0,
+        deviceScaleFactor: options.deviceScaleFactor ?? 1,
+        mobile: options.mobile ?? false,
+      })
+    }
+    if (options.network !== undefined) {
+      await send('Network.emulateNetworkConditions', networkConditions(options.network))
+    }
+    if (options.cpuThrottlingRate !== undefined) {
+      if (!(options.cpuThrottlingRate >= 1)) {
+        throw new ChromeError('cpuThrottlingRate must be a number >= 1 (1 = no throttling)', 'CHROME_CDP_ERROR')
+      }
+      await send('Emulation.setCPUThrottlingRate', { rate: options.cpuThrottlingRate })
+    }
+    if (options.latitude !== undefined || options.longitude !== undefined) {
+      await send('Emulation.setGeolocationOverride', {
+        latitude: options.latitude ?? 0,
+        longitude: options.longitude ?? 0,
+        accuracy: options.accuracy ?? 100,
+      })
+    }
+    if (options.timezoneId !== undefined) {
+      await send('Emulation.setTimezoneOverride', { timezoneId: options.timezoneId })
+    }
+    if (options.userAgent !== undefined || options.locale !== undefined) {
+      await send('Emulation.setUserAgentOverride', {
+        userAgent: options.userAgent ?? '',
+        ...options.locale !== undefined ? { acceptLanguage: options.locale } : {},
+      })
+    }
+    return { applied }
+  }
+
+  /**
+   * Print the page to PDF via `Page.printToPDF` and write it to `path`
+   * (created recursively when missing). Returns the file size in bytes.
+   */
+  async pdf(options: {
+    path: string
+    landscape?: boolean
+    printBackground?: boolean
+    paperFormat?: string
+    scale?: number
+    pageRanges?: string
+    signal?: AbortSignal
+  }): Promise<{ path: string; bytes: number }> {
+    const active = await this.ensure(options.signal)
+    const response = await active.client.send('Page.printToPDF', {
+      landscape: options.landscape ?? false,
+      printBackground: options.printBackground ?? true,
+      ...options.paperFormat !== undefined ? { paperFormat: options.paperFormat } : {},
+      ...options.scale !== undefined ? { scale: options.scale } : {},
+      ...options.pageRanges !== undefined && options.pageRanges.length > 0 ? { pageRanges: options.pageRanges } : {},
+    }, { sessionId: active.sessionId, signal: options.signal }) as { data?: string }
+    if (typeof response.data !== 'string' || response.data.length === 0) {
+      throw new ChromeError('Page.printToPDF returned no data', 'CHROME_CDP_ERROR')
+    }
+    const bytes = Buffer.from(response.data, 'base64')
+    await fs.mkdir(dirname(options.path), { recursive: true })
+    await fs.writeFile(options.path, bytes)
+    return { path: options.path, bytes: bytes.length }
   }
 
   /**

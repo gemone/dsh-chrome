@@ -34,6 +34,8 @@ import { applyChromePressKeyTool } from './tools/press-key.ts'
 import { applyChromeCloseTool } from './tools/close.ts'
 import { applyChromeNetTools } from './tools/net.ts'
 import { applyChromeConsoleTool } from './tools/console.ts'
+import { applyChromeEmulateTool } from './tools/emulate.ts'
+import { applyChromePdfTool } from './tools/pdf.ts'
 
 export { ChromeError, computeCaptureScale } from './types.ts'
 export type {
@@ -71,6 +73,8 @@ export {
   applyChromeCloseTool,
   applyChromeNetTools,
   applyChromeConsoleTool,
+  applyChromeEmulateTool,
+  applyChromePdfTool,
 } from './tools/index.ts'
 
 /** Default remote debugging port for a launched Chrome. */
@@ -129,6 +133,10 @@ export interface Config {
   netLog?: boolean
   /** Register `chrome_console_read` (console + exception capture). Defaults to true. */
   consoleLog?: boolean
+  /** Register `chrome_emulate` (environment emulation). Defaults to true. */
+  emulate?: boolean
+  /** Register `chrome_pdf` (print to PDF). Defaults to true. */
+  pdf?: boolean
   /** Ring-buffer capacity per observatory stream (network / console). Defaults to 500. */
   observatoryMaxEntries?: number
   /** Explicit Chrome executable path; omitted = discover. */
@@ -172,6 +180,8 @@ export const Config: z<Config> = z.object({
   close: z.boolean().default(true),
   netLog: z.boolean().default(true),
   consoleLog: z.boolean().default(true),
+  emulate: z.boolean().default(true),
+  pdf: z.boolean().default(true),
   observatoryMaxEntries: z.number().default(DEFAULT_OBSERVATORY_MAX_ENTRIES),
   executablePath: z.string(),
   launch: z.boolean().default(true),
@@ -207,6 +217,8 @@ type ResolvedConfig = {
   close: boolean
   netLog: boolean
   consoleLog: boolean
+  emulate: boolean
+  pdf: boolean
   observatoryMaxEntries: number
   executablePath: string | undefined
   launch: boolean
@@ -300,4 +312,6 @@ export function apply(ctx: Context, config: Config): void {
   if (resolved.close) applyChromeCloseTool(ctx, chrome, resolved.operationTimeoutMs)
   if (resolved.netLog) applyChromeNetTools(ctx, chrome, resolved.operationTimeoutMs)
   if (resolved.consoleLog) applyChromeConsoleTool(ctx, chrome, resolved.operationTimeoutMs)
+  if (resolved.emulate) applyChromeEmulateTool(ctx, chrome, resolved.operationTimeoutMs)
+  if (resolved.pdf) applyChromePdfTool(ctx, chrome, resolved.operationTimeoutMs)
 }
