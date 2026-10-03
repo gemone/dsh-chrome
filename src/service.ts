@@ -15,12 +15,14 @@ import fs from 'node:fs/promises'
 import { dirname } from 'node:path'
 import { CdpClient, createCdpClient } from './cdp.ts'
 import { networkConditions } from './emulation.ts'
+import { formatAxTree, storageReadExpression, storageWriteExpression, type RawAxNode } from './a11y.ts'
 import { disposeChild, fetchVersionInfo, launchChrome, normalizeDebugEndpoint, type LaunchedChrome } from './launcher.ts'
 import { markdownExpression, type RawMarkdownSnapshot } from './markdown.ts'
 import { pageSnapshotExpression, type RawPageSnapshot } from './page-walker.ts'
 import {
   Observatory,
   DEFAULT_NET_BODY_MAX_CHARS,
+  DEFAULT_STORAGE_VALUE_MAX_CHARS,
   DEFAULT_OBSERVATORY_MAX_ENTRIES,
   formatActivityHint as formatActivityHintSafe,
   type ConsoleLevel,
@@ -222,6 +224,9 @@ export class ChromeRuntime extends Service {
     await client.send('Network.enable', undefined, { sessionId, signal })
     // Browser-side log (CSP violations, failed loads); best-effort — old targets may refuse.
     await client.send('Log.enable', undefined, { sessionId, signal }).catch(() => undefined)
+    // Compute the full accessibility tree for a11ySnapshot; Chromium builds it
+    // lazily and only tracks it while the domain is enabled. Best-effort.
+    await client.send('Accessibility.enable', undefined, { sessionId, signal }).catch(() => undefined)
     this.trackNetwork(client, sessionId, network, observatory)
     this.trackConsole(client, sessionId, observatory)
     return { client, targetId, sessionId, launched, network, observatory, readCursors, pageRefs }
@@ -691,6 +696,138 @@ export class ChromeRuntime extends Service {
     } finally {
       if (active.network.timer !== undefined) clearTimeout(active.network.timer)
       this.state = { kind: 'connected-browser', client: active.client, launched: active.launched }
+    }
+  }
+
+  /**
+   * Capture the full accessibility tree, bounded, formatted as an indented
+   * role/name/state tree. A semantic read alternative to `pageSnapshot`.
+   */
+  async a11ySnapshot(maxNodes: number, signal?: AbortSignal): Promise<{
+    url: string
+    title: string
+    readyState: string
+    tree: string
+    nodeCount: number
+    truncated: boolean
+  }> {
+    const active = await this.ensure(signal)
+    const response = await active.client.send('Accessibility.getFullAXTree', undefined, {
+      sessionId: active.sessionId, signal,
+    }) as { nodes?: RawAxNode[] }
+    const nodes = response.nodes ?? []
+    const formatted = formatAxTree(nodes, maxNodes)
+    const meta = await this.evaluate('JSON.stringify({ url: location.href, title: document.title, readyState: document.readyState })', { signal })
+    const parsed = parseJsonString(meta.result) as { url?: string; title?: string; readyState?: string } | undefined
+    return {
+      url: parsed?.url ?? '',
+      title: parsed?.title ?? '',
+      readyState: parsed?.readyState ?? '',
+      tree: formatted.tree,
+      nodeCount: formatted.count,
+      truncated: formatted.truncated,
+    }
+  }
+
+  /**
+   * One storage operation: browser cookies (via the Network domain, scoped to
+   * the current page's URL unless `url` is given) or the current origin's
+   * localStorage / sessionStorage (via the page).
+   */
+  async storage(options: {
+    kind: 'cookies' | 'local' | 'session'
+    operation: 'get' | 'set' | 'remove' | 'clear'
+    key?: string
+    value?: string
+    url?: string
+    maxChars?: number
+    signal?: AbortSignal
+  }): Promise<{ result: unknown }> {
+    const active = await this.ensure(options.signal)
+    const { client, sessionId } = active
+    if (options.kind === 'cookies') {
+      switch (options.operation) {
+        case 'get': {
+          const cookies = await client.send('Network.getCookies', {
+            ...options.url !== undefined && options.url.length > 0 ? { urls: [options.url] } : {},
+          }, { sessionId, signal: options.signal }) as { cookies?: unknown }
+          return { result: cookies.cookies ?? [] }
+        }
+        case 'set': {
+          if (options.key === undefined || options.key.length === 0 || options.value === undefined) {
+            throw new ChromeError('cookie "set" requires both key (name) and value', 'CHROME_CDP_ERROR')
+          }
+          const pageUrl = await this.evaluate('location.href', { signal: options.signal })
+          const set = await client.send('Network.setCookie', {
+            name: options.key,
+            value: options.value,
+            url: options.url ?? (typeof pageUrl.result === 'string' ? pageUrl.result : undefined),
+          }, { sessionId, signal: options.signal }) as { success?: boolean }
+          if (set.success === false) {
+            throw new ChromeError(`setting cookie "${options.key}" failed (check the URL/path scope)`, 'CHROME_CDP_ERROR')
+          }
+          return { result: { ok: true, name: options.key } }
+        }
+        case 'remove': {
+          if (options.key === undefined || options.key.length === 0) {
+            throw new ChromeError('cookie "remove" requires key (name)', 'CHROME_CDP_ERROR')
+          }
+          // Network.deleteCookies requires url or domain; default to the
+          // current page's URL so removal is scoped like "set" is.
+          let removalUrl = options.url
+          if (removalUrl === undefined || removalUrl.length === 0) {
+            const pageUrl = await this.evaluate('location.href', { signal: options.signal })
+            if (typeof pageUrl.result === 'string') removalUrl = pageUrl.result
+          }
+          await client.send('Network.deleteCookies', {
+            name: options.key,
+            ...removalUrl !== undefined ? { url: removalUrl } : {},
+          }, { sessionId, signal: options.signal })
+          return { result: { ok: true, name: options.key } }
+        }
+        case 'clear': {
+          await client.send('Network.clearBrowserCookies', undefined, { sessionId, signal: options.signal })
+          return { result: { ok: true, cleared: 'all cookies' } }
+        }
+      }
+    }
+    // Web storage via the page.
+    switch (options.operation) {
+      case 'get': {
+        const expression = storageReadExpression(options.kind, options.key, options.maxChars ?? DEFAULT_STORAGE_VALUE_MAX_CHARS)
+        const evaluation = await active.client.send('Runtime.evaluate', {
+          expression, awaitPromise: false, returnByValue: true,
+        }, { sessionId, signal: options.signal }) as { result?: { value?: string } }
+        const parsed = parseJsonString(evaluation.result?.value)
+        return { result: parsed ?? {} }
+      }
+      case 'set': {
+        if (options.key === undefined || options.key.length === 0 || options.value === undefined) {
+          throw new ChromeError(`web storage "set" requires both key and value`, 'CHROME_CDP_ERROR')
+        }
+        const expression = storageWriteExpression(options.kind, 'set', options.key, options.value)
+        await active.client.send('Runtime.evaluate', {
+          expression, awaitPromise: false, returnByValue: true,
+        }, { sessionId, signal: options.signal })
+        return { result: { ok: true, key: options.key } }
+      }
+      case 'remove': {
+        if (options.key === undefined || options.key.length === 0) {
+          throw new ChromeError(`web storage "remove" requires key`, 'CHROME_CDP_ERROR')
+        }
+        const expression = storageWriteExpression(options.kind, 'remove', options.key, undefined)
+        await active.client.send('Runtime.evaluate', {
+          expression, awaitPromise: false, returnByValue: true,
+        }, { sessionId, signal: options.signal })
+        return { result: { ok: true, key: options.key } }
+      }
+      case 'clear': {
+        const expression = storageWriteExpression(options.kind, 'clear', undefined, undefined)
+        await active.client.send('Runtime.evaluate', {
+          expression, awaitPromise: false, returnByValue: true,
+        }, { sessionId, signal: options.signal })
+        return { result: { ok: true, cleared: options.kind === 'local' ? 'localStorage' : 'sessionStorage' } }
+      }
     }
   }
 

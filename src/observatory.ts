@@ -12,6 +12,9 @@ export const DEFAULT_OBSERVATORY_MAX_ENTRIES = 500
 /** Default character cap when fetching one network response body. */
 export const DEFAULT_NET_BODY_MAX_CHARS = 100_000
 
+/** Default per-value cap when reading all web-storage entries. */
+export const DEFAULT_STORAGE_VALUE_MAX_CHARS = 2000
+
 /** Console severity levels, ordered from least to most severe. */
 export type ConsoleLevel = 'debug' | 'log' | 'info' | 'warning' | 'error'
 

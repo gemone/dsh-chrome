@@ -26,9 +26,14 @@ export function applyChromePageSnapshotTool(ctx: Context, chrome: ChromeRuntime,
 
   ctx.tools.register(defineTool({
     name: 'chrome_page_snapshot',
-    description: 'Read the controlled Chrome page as a structured element tree (roles, names, states) with [ref=eN] ids usable by chrome_click/chrome_type/chrome_scroll. Works without image support; bounded by the node budget.',
+    description: 'Read the controlled Chrome page as a structured element tree (roles, names, states) with [ref=eN] ids usable by chrome_click/chrome_type/chrome_scroll. format "a11y" reads the accessibility tree instead (semantic roles/states, no refs). Works without image support; bounded by the node budget.',
     parameters: {
       maxNodes: { type: 'integer', description: `Maximum tree nodes to emit (default ${maxNodes}).` },
+      format: {
+        type: 'string',
+        description: 'Tree flavor: "dom" (default, [ref=eN] actionable) or "a11y" (accessibility tree, semantic read).',
+        enum: ['dom', 'a11y'],
+      },
     },
     output: {
       schema: {
@@ -53,6 +58,17 @@ export function applyChromePageSnapshotTool(ctx: Context, chrome: ChromeRuntime,
     async execute(args, exec) {
       const budget = args.maxNodes ?? maxNodes
       if (!Number.isInteger(budget) || budget < 1) throw new Error('maxNodes must be a positive integer')
+      if (args.format === 'a11y') {
+        const ax = await chrome.a11ySnapshot(budget, exec.signal)
+        return {
+          url: ax.url,
+          title: ax.title,
+          readyState: ax.readyState,
+          tree: ax.tree,
+          refCount: 0,
+          truncated: ax.truncated,
+        }
+      }
       const result = await chrome.pageSnapshot(budget, exec.signal)
       return {
         url: result.url,
@@ -63,8 +79,8 @@ export function applyChromePageSnapshotTool(ctx: Context, chrome: ChromeRuntime,
         truncated: result.truncated,
       }
     },
-    presentCall(): GenericCallView {
-      return { card: 'generic', title: 'Snapshot page structure', kind: 'read' }
+    presentCall(args): GenericCallView {
+      return { card: 'generic', title: args.format === 'a11y' ? 'Snapshot accessibility tree' : 'Snapshot page structure', kind: 'read' }
     },
   }))
 }

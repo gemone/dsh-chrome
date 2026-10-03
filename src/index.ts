@@ -36,6 +36,7 @@ import { applyChromeNetTools } from './tools/net.ts'
 import { applyChromeConsoleTool } from './tools/console.ts'
 import { applyChromeEmulateTool } from './tools/emulate.ts'
 import { applyChromePdfTool } from './tools/pdf.ts'
+import { applyChromeStorageTool } from './tools/storage.ts'
 
 export { ChromeError, computeCaptureScale } from './types.ts'
 export type {
@@ -75,6 +76,7 @@ export {
   applyChromeConsoleTool,
   applyChromeEmulateTool,
   applyChromePdfTool,
+  applyChromeStorageTool,
 } from './tools/index.ts'
 
 /** Default remote debugging port for a launched Chrome. */
@@ -137,6 +139,8 @@ export interface Config {
   emulate?: boolean
   /** Register `chrome_pdf` (print to PDF). Defaults to true. */
   pdf?: boolean
+  /** Register `chrome_storage` (cookies + web storage). Defaults to true. */
+  storage?: boolean
   /** Ring-buffer capacity per observatory stream (network / console). Defaults to 500. */
   observatoryMaxEntries?: number
   /** Explicit Chrome executable path; omitted = discover. */
@@ -182,6 +186,7 @@ export const Config: z<Config> = z.object({
   consoleLog: z.boolean().default(true),
   emulate: z.boolean().default(true),
   pdf: z.boolean().default(true),
+  storage: z.boolean().default(true),
   observatoryMaxEntries: z.number().default(DEFAULT_OBSERVATORY_MAX_ENTRIES),
   executablePath: z.string(),
   launch: z.boolean().default(true),
@@ -219,6 +224,7 @@ type ResolvedConfig = {
   consoleLog: boolean
   emulate: boolean
   pdf: boolean
+  storage: boolean
   observatoryMaxEntries: number
   executablePath: string | undefined
   launch: boolean
@@ -314,4 +320,5 @@ export function apply(ctx: Context, config: Config): void {
   if (resolved.consoleLog) applyChromeConsoleTool(ctx, chrome, resolved.operationTimeoutMs)
   if (resolved.emulate) applyChromeEmulateTool(ctx, chrome, resolved.operationTimeoutMs)
   if (resolved.pdf) applyChromePdfTool(ctx, chrome, resolved.operationTimeoutMs)
+  if (resolved.storage) applyChromeStorageTool(ctx, chrome, resolved.operationTimeoutMs)
 }
