@@ -27,7 +27,7 @@ export function applyChromeEmulateTool(ctx: Context, chrome: ChromeRuntime, time
 
   ctx.tools.register(defineTool({
     name: 'chrome_emulate',
-    description: 'Overriding the controlled Chrome page\'s environment: viewport (width/height/deviceScaleFactor/mobile), network throttling (network: offline/slow3G/fast3G/none), CPU throttling (cpuThrottlingRate), geolocation (latitude/longitude/accuracy), timezoneId, locale, userAgent. clear: true resets all overrides first; omitted fields stay unchanged.',
+    description: 'Overriding the controlled Chrome page\'s environment: viewport (width/height/deviceScaleFactor/mobile), network throttling (network: offline/slow3G/fast3G/none), CPU throttling (cpuThrottlingRate), geolocation (latitude/longitude/accuracy), timezoneId, locale, userAgent, permissions (grant browser permissions), colorScheme/reducedMotion (emulated media features). clear: true resets all overrides first; omitted fields stay unchanged.',
     parameters: {
       clear: { type: 'boolean', description: 'Reset all overrides to defaults before applying the other fields (default false).' },
       width: { type: 'integer', description: 'Viewport width in CSS px (0 = responsive).' },
@@ -46,6 +46,22 @@ export function applyChromeEmulateTool(ctx: Context, chrome: ChromeRuntime, time
       timezoneId: { type: 'string', description: 'IANA timezone (e.g. "America/New_York"); empty string resets to system.' },
       locale: { type: 'string', description: 'Accept-Language locale (e.g. "zh-CN").' },
       userAgent: { type: 'string', description: 'User-Agent to send; empty string resets.' },
+      permissions: {
+        type: 'array',
+        description: 'Browser permissions to grant (e.g. "geolocation", "notifications", "clipboard-read", "clipboard-write", "camera", "microphone").',
+        items: { type: 'string' },
+      },
+      resetPermissions: { type: 'boolean', description: 'Reset all granted permissions first.' },
+      colorScheme: {
+        type: 'string',
+        description: 'Emulated prefers-color-scheme ("dark" or "light").',
+        enum: ['dark', 'light'],
+      },
+      reducedMotion: {
+        type: 'string',
+        description: 'Emulated prefers-reduced-motion.',
+        enum: ['reduce', 'no-preference'],
+      },
     },
     output: {
       schema: {
@@ -75,6 +91,10 @@ export function applyChromeEmulateTool(ctx: Context, chrome: ChromeRuntime, time
         ...args.timezoneId !== undefined ? { timezoneId: args.timezoneId } : {},
         ...args.locale !== undefined ? { locale: args.locale } : {},
         ...args.userAgent !== undefined ? { userAgent: args.userAgent } : {},
+        ...args.permissions !== undefined && args.permissions.length > 0 ? { permissions: args.permissions } : {},
+        ...args.resetPermissions === true ? { resetPermissions: true } : {},
+        ...args.colorScheme !== undefined ? { colorScheme: args.colorScheme } : {},
+        ...args.reducedMotion !== undefined ? { reducedMotion: args.reducedMotion } : {},
         signal: exec.signal,
       })
       const text = result.applied.length === 0

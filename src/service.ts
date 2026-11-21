@@ -1192,6 +1192,14 @@ export class ChromeRuntime extends Service {
     timezoneId?: string
     locale?: string
     userAgent?: string
+    /** Browser permissions to grant (e.g. "geolocation", "clipboard-read", "notifications", "camera"). */
+    permissions?: readonly string[]
+    /** Reset all granted permissions first. */
+    resetPermissions?: boolean
+    /** Emulated `prefers-color-scheme`. */
+    colorScheme?: 'dark' | 'light'
+    /** Emulated `prefers-reduced-motion`. */
+    reducedMotion?: 'reduce' | 'no-preference'
     signal?: AbortSignal
   }): Promise<{ applied: readonly string[] }> {
     const active = await this.ensure(options.signal)
@@ -1209,6 +1217,27 @@ export class ChromeRuntime extends Service {
       await send('Network.emulateNetworkConditions', { offline: false, latency: 0, downloadThroughput: -1, uploadThroughput: -1 })
       await send('Emulation.setCPUThrottlingRate', { rate: 1 })
       await send('Emulation.setUserAgentOverride', { userAgent: '' })
+      await send('Emulation.setEmulatedMedia', { features: [] })
+      // Browser-domain reset (no sessionId — Browser commands are browser-level).
+      await client.send('Browser.resetPermissions', undefined, { signal })
+      applied.push('Browser.resetPermissions')
+    }
+    if (options.resetPermissions === true) {
+      await client.send('Browser.resetPermissions', undefined, { signal })
+      applied.push('Browser.resetPermissions')
+    }
+    if (options.permissions !== undefined && options.permissions.length > 0) {
+      // Browser-domain grant; browser-level send (sessionId would be rejected).
+      await client.send('Browser.grantPermissions', {
+        permissions: [...options.permissions],
+      }, { signal })
+      applied.push(`Browser.grantPermissions ${JSON.stringify(options.permissions)}`)
+    }
+    if (options.colorScheme !== undefined || options.reducedMotion !== undefined) {
+      const features: Array<{ name: string; value: string }> = []
+      if (options.colorScheme !== undefined) features.push({ name: 'prefers-color-scheme', value: options.colorScheme })
+      if (options.reducedMotion !== undefined) features.push({ name: 'prefers-reduced-motion', value: options.reducedMotion })
+      await send('Emulation.setEmulatedMedia', { features })
     }
     if (options.width !== undefined || options.height !== undefined || options.deviceScaleFactor !== undefined || options.mobile !== undefined) {
       await send('Emulation.setDeviceMetricsOverride', {
