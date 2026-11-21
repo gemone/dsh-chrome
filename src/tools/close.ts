@@ -1,7 +1,9 @@
 /**
  * The model-facing `chrome_close` tool: close the current tab or the entire
  * browser. Closing a tab keeps the browser alive and auto-creates a new tab on
- * next tool call. Closing the browser kills the Chrome process entirely.
+ * next tool call. Closing the browser closes the connection and kills the
+ * Chrome process the plugin launched; a reused (attached) instance is only
+ * detached.
  * @module dsh-chrome/tools/close
  */
 
@@ -21,12 +23,12 @@ export function applyChromeCloseTool(ctx: Context, chrome: ChromeRuntime, timeou
   ctx.systemPrompt.section({
     name: 'tool:chrome_close',
     order: 118,
-    text: 'Use the chrome_close tool to close the current Chrome tab or the entire browser. Closing a tab keeps the browser alive and auto-creates a new tab on next tool call.',
+    text: 'Use the chrome_close tool to close the current Chrome tab or the entire browser. Closing a tab keeps the browser alive and auto-creates a new tab on next tool call. Closing the browser kills the managed Chrome process; a reused (attached) instance is only detached and keeps running.',
   })
 
   ctx.tools.register(defineTool({
     name: 'chrome_close',
-    description: 'Close the current Chrome tab or the entire browser. "tab" keeps the browser alive and auto-creates a new tab on next tool call; "browser" kills the Chrome process.',
+    description: 'Close the current Chrome tab or the entire browser. "tab" keeps the browser alive and auto-creates a new tab on next tool call; "browser" closes the connection and kills the Chrome process when the plugin launched it — a reused (attached) instance is only detached and stays running.',
     parameters: {
       what: {
         type: 'string',
@@ -42,8 +44,16 @@ export function applyChromeCloseTool(ctx: Context, chrome: ChromeRuntime, timeou
           closed: { type: 'string', required: true, enum: ['tab', 'browser'] },
         },
       },
+      // Ownership-neutral on purpose: by render time the connection is already
+      // closed, so asking the runtime who owned it would always answer "not
+      // me". Both outcomes share one accurate sentence.
       render: (_args, value): ContentBlock[] => [
-        { type: 'text', text: value.closed === 'tab' ? 'Closed the current tab. A new tab will open on next tool call.' : 'Closed the Chrome browser. A new Chrome will launch on next tool call.' },
+        {
+          type: 'text',
+          text: value.closed === 'tab'
+            ? 'Closed the current tab. A new tab will open on next tool call.'
+            : 'Closed the browser connection. A managed Chrome relaunches on next tool call; a reused instance stays running and is re-attached.',
+        },
       ],
     },
     timeoutMs,

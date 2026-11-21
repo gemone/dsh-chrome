@@ -3,6 +3,11 @@
  * single Chrome process (when launching) and one browser-level CDP connection
  * driving a dedicated page target through a flattened session.
  *
+ * Connection strategies: launch a managed Chrome, attach to a `cdpUrl`, or —
+ * the default in launch mode — probe the configured debugger `port` first and
+ * reuse an instance already listening there (`ensureConnection` exposes the
+ * choice to the model via `chrome_connect`).
+ *
  * Resources start lazily on first use and are torn down with the owning fiber
  * (an effect-scoped disposer closes the socket and terminates the child). The
  * interface is provider-shaped so a future split into a capability seam +
@@ -16,7 +21,7 @@ import { dirname } from 'node:path'
 import { CdpClient, createCdpClient } from './cdp.ts'
 import { networkConditions } from './emulation.ts'
 import { formatAxTree, storageReadExpression, storageWriteExpression, type RawAxNode } from './a11y.ts'
-import { disposeChild, fetchVersionInfo, launchChrome, normalizeDebugEndpoint, type LaunchedChrome } from './launcher.ts'
+import { disposeChild, fetchVersionInfo, launchChrome, normalizeDebugEndpoint, probeExistingEndpoint, type ChromeVersionInfo, type LaunchedChrome } from './launcher.ts'
 import { markdownExpression, type RawMarkdownSnapshot } from './markdown.ts'
 import { pageSnapshotExpression, type RawPageSnapshot } from './page-walker.ts'
 import {
@@ -50,6 +55,12 @@ export interface ChromeRuntimeConfig {
   readonly launch: boolean
   /** Existing CDP endpoint to attach to when `launch` is false (`ws://` or `http(s)://`). */
   readonly cdpUrl?: string
+  /**
+   * Before launching on `port`, probe the debugger endpoint first and attach
+   * to an instance already listening there instead of spawning a second
+   * Chrome over the same port. False = always launch (the port must be free).
+   */
+  readonly reuseExisting: boolean
   /** Remote debugging port for a launched Chrome. */
   readonly port: number
   /** Host a launched Chrome binds its endpoint on. */
@@ -64,6 +75,10 @@ export interface ChromeRuntimeConfig {
   readonly operationTimeoutMs: number
   /** Default quiet window before `networkidle*` is declared. */
   readonly networkIdleMs: number
+  /** How to answer JS dialogs (alert/confirm/prompt/beforeunload). Default "accept". */
+  readonly dialogPolicy?: 'accept' | 'dismiss'
+  /** Prompt text sent when answering a `prompt` dialog under "accept". */
+  readonly dialogPromptText?: string
 }
 
 declare module '@deepseek-ai/cordis' {
@@ -78,13 +93,28 @@ interface NetworkState {
   timer?: NodeJS.Timeout
 }
 
+/** Strategy for obtaining the browser connection (the `chrome_connect` modes). */
+export type ChromeConnectMode = 'auto' | 'reuse' | 'launch'
+
+/** Snapshot of the current browser connection, reported by {@link ChromeRuntime.ensureConnection}. */
+export interface ChromeConnectionInfo {
+  /** How the browser was obtained: attached to an existing instance, or launched fresh. */
+  readonly connected: 'attached' | 'launched'
+  /** The debugger endpoint base URL in use. */
+  readonly endpoint: string
+  /** Browser version string from `/json/version` (empty when unknown). */
+  readonly browser: string
+  /** The page target id driving the tools. */
+  readonly targetId: string
+}
+
 /** Connection lifecycle state. */
 type ConnectionState =
   | { kind: 'idle' }
   | { kind: 'connecting'; promise: Promise<ActiveConnection> }
   | { kind: 'connected'; active: ActiveConnection }
   /** Browser connection alive, but the page target was closed (e.g. via closeTab). */
-  | { kind: 'connected-browser'; client: CdpClient; launched?: LaunchedChrome }
+  | { kind: 'connected-browser'; client: CdpClient; endpoint: string; browser: string; launched?: LaunchedChrome }
   | { kind: 'disposed' }
 
 /** A live browser connection driving one page target. */
@@ -92,7 +122,11 @@ interface ActiveConnection {
   readonly client: CdpClient
   readonly targetId: string
   readonly sessionId: string
-  /** The launched child, when this runtime owns it. */
+  /** The debugger endpoint base URL this connection came from. */
+  readonly endpoint: string
+  /** Browser version string reported by `/json/version` (empty when unknown). */
+  readonly browser: string
+  /** The launched child, when this runtime owns it (absent when attached to an existing instance). */
   readonly launched?: LaunchedChrome
   /** Per-session network request tracker for `networkidle*` waits. */
   readonly network: NetworkState
@@ -134,9 +168,12 @@ export class ChromeRuntime extends Service {
    * promise.
    *
    * @param signal - optional cancellation for the connect/attach handshake.
+   * @param mode - explicit connect strategy; defaults to the `reuseExisting`
+   * config (probe-and-attach when true, always launch when false).
    * @returns the active connection.
    */
-  private async ensure(signal?: AbortSignal): Promise<ActiveConnection> {
+  private async ensure(signal?: AbortSignal, mode?: ChromeConnectMode): Promise<ActiveConnection> {
+    const connectMode = mode ?? (this.config.reuseExisting ? 'auto' : 'launch')
     if (this.state.kind === 'connected') {
       const active = this.state.active
       if (!active.client.isClosed) return active
@@ -145,13 +182,13 @@ export class ChromeRuntime extends Service {
       this.state = { kind: 'idle' }
     }
     if (this.state.kind === 'connected-browser') {
-      const { client, launched } = this.state
+      const { client, endpoint, browser, launched } = this.state
       if (client.isClosed) {
         this.state = { kind: 'idle' }
-        return this.ensure(signal)
+        return this.ensure(signal, mode)
       }
       // Browser alive but no target: create a fresh page target on the existing connection.
-      const active = await this.createTargetOnClient(client, launched, signal)
+      const active = await this.createTargetOnClient(client, { endpoint, browser, launched }, signal)
       this.state = { kind: 'connected', active }
       return active
     }
@@ -159,7 +196,7 @@ export class ChromeRuntime extends Service {
       throw new ChromeError('Chrome runtime has been disposed', 'CHROME_CDP_ERROR')
     }
     if (this.state.kind === 'connecting') return this.state.promise
-    const promise = this.connect(signal)
+    const promise = this.connectWithMode(connectMode, signal)
     this.state = { kind: 'connecting', promise }
     try {
       const active = await promise
@@ -171,45 +208,135 @@ export class ChromeRuntime extends Service {
     }
   }
 
-  /** Open the browser connection and attach to a fresh page target. */
-  private async connect(signal?: AbortSignal): Promise<ActiveConnection> {
-    let webSocketDebuggerUrl: string
-    let launched: LaunchedChrome | undefined
-    if (this.config.launch) {
-      launched = launchChrome({
-        executablePath: this.config.executablePath,
-        port: this.config.port,
-        host: this.config.host,
-        headless: this.config.headless,
-        ...this.config.userDataDir !== undefined ? { userDataDir: this.config.userDataDir } : {},
-        extraArgs: this.config.extraArgs,
-      })
-      const version = await waitForReady(launched.endpoint, this.config.operationTimeoutMs, signal, launched)
-      webSocketDebuggerUrl = version.webSocketDebuggerUrl
-    } else {
+  /**
+   * Ensure a live connection using an explicit strategy and report what is
+   * now driving the tools. This is the model-facing `chrome_connect` surface:
+   * the agent chooses whether to reuse the instance already listening on the
+   * debugger port or to force a fresh managed launch.
+   *
+   * @param mode - `"auto"` attaches when an instance already listens on the
+   * debugger port and launches otherwise; `"reuse"` attaches only (fails when
+   * nothing is listening); `"launch"` replaces the current connection with a
+   * fresh managed instance — a connection this runtime owns is closed (and
+   * its Chrome killed) first, and the call fails with `CHROME_LAUNCH_FAILED`
+   * when the port is still served by an instance this runtime does not own.
+   * @param signal - optional cancellation for the connect/attach handshake.
+   */
+  async ensureConnection(mode: ChromeConnectMode = 'auto', signal?: AbortSignal): Promise<ChromeConnectionInfo> {
+    if (this.state.kind === 'disposed') {
+      throw new ChromeError('Chrome runtime has been disposed', 'CHROME_CDP_ERROR')
+    }
+    if (mode === 'launch') {
+      // "launch" means a fresh managed instance: drop any existing connection
+      // first (owned child killed, port freed). A reused instance is only
+      // detached — it keeps serving the port, so the launch below fails with
+      // a clear "already serving" error instead of a doomed spawn.
+      await this.closeBrowser()
+    }
+    const active = await this.ensure(signal, mode)
+    return {
+      connected: active.launched !== undefined ? 'launched' : 'attached',
+      endpoint: active.endpoint,
+      browser: active.browser,
+      targetId: active.targetId,
+    }
+  }
+
+  /** Whether the currently connected browser is a child process this runtime owns. False when idle or attached to a reused instance. */
+  get ownsBrowserProcess(): boolean {
+    if (this.state.kind === 'connected') return this.state.active.launched !== undefined
+    if (this.state.kind === 'connected-browser') return this.state.launched !== undefined
+    return false
+  }
+
+  /**
+   * Open the browser connection and attach to a page target, following the
+   * requested strategy. Attach paths (existing endpoint on the configured
+   * port, or `cdpUrl`) spawn nothing and own no child; the launch path spawns
+   * a managed Chrome the runtime tears down on dispose.
+   */
+  private async connectWithMode(mode: ChromeConnectMode, signal?: AbortSignal): Promise<ActiveConnection> {
+    if (!this.config.launch) {
+      if (mode === 'launch') {
+        throw new ChromeError('managed launch is disabled by config ("launch": false); attach to "cdpUrl" instead', 'CHROME_CDP_ERROR')
+      }
       const endpoint = this.config.cdpUrl
       if (endpoint === undefined || endpoint.length === 0) {
         throw new ChromeError('Chrome connect mode requires a "cdpUrl" (ws:// or http(s):// endpoint)', 'CHROME_ENDPOINT_UNREACHABLE')
       }
-      webSocketDebuggerUrl = await resolveBrowserWsUrl(endpoint, signal)
+      // Chrome ≥111 rejects DevTools HTTP requests whose Host header is not an
+      // IP; a `localhost` cdpUrl (especially behind a proxy) trips this, so poll by IP.
+      const normalized = normalizeDebugEndpoint(endpoint.replace(/\/$/, ''))
+      if (normalized.startsWith('ws://') || normalized.startsWith('wss://')) {
+        return this.openClient(normalized, { endpoint: normalized }, signal)
+      }
+      const version = await fetchVersionInfo(normalized, signal)
+      return this.openClient(version.webSocketDebuggerUrl, { endpoint: normalized, browser: version.Browser ?? '' }, signal)
     }
 
+    const endpoint = normalizeDebugEndpoint(`http://${this.config.host}:${this.config.port}`)
+    // Reuse preflight: every strategy asks the port first. An instance that
+    // answers wins — except an explicit fresh launch, which refuses to spawn
+    // a doomed second Chrome over a port that is already served.
+    const existing = await probeExistingEndpoint(endpoint, signal)
+    if (existing !== undefined) {
+      if (mode === 'launch') {
+        throw new ChromeError(
+          `a Chrome debugger is already serving ${endpoint} (${existing.Browser ?? 'unknown version'}); attach to it with mode "auto" or "reuse", or free the port / pick another "port"`,
+          'CHROME_LAUNCH_FAILED',
+        )
+      }
+      return this.openClient(existing.webSocketDebuggerUrl, { endpoint, browser: existing.Browser ?? '' }, signal)
+    }
+    if (mode === 'reuse') {
+      throw new ChromeError(
+        `no Chrome debugger is listening on ${endpoint}; start Chrome with --remote-debugging-port=${this.config.port} first, or connect with mode "auto" or "launch" to start a managed instance`,
+        'CHROME_ENDPOINT_UNREACHABLE',
+      )
+    }
+
+    const launched = launchChrome({
+      executablePath: this.config.executablePath,
+      port: this.config.port,
+      host: this.config.host,
+      headless: this.config.headless,
+      ...this.config.userDataDir !== undefined ? { userDataDir: this.config.userDataDir } : {},
+      extraArgs: this.config.extraArgs,
+    })
+    const version = await waitForReady(launched.endpoint, this.config.operationTimeoutMs, signal, launched)
+    return this.openClient(version.webSocketDebuggerUrl, { endpoint: launched.endpoint, browser: version.Browser ?? '', launched }, signal)
+  }
+
+  /**
+   * Open a browser-level CDP connection and attach to a fresh page target.
+   * Shared by every connect path; on failure the socket is closed and the
+   * owned child (when any) terminated before the error propagates.
+   */
+  private async openClient(
+    webSocketDebuggerUrl: string,
+    info: { endpoint: string; browser?: string; launched?: LaunchedChrome },
+    signal?: AbortSignal,
+  ): Promise<ActiveConnection> {
     const client = await createCdpClient(webSocketDebuggerUrl, signal)
     try {
-      return await this.createTargetOnClient(client, launched, signal)
+      return await this.createTargetOnClient(client, info, signal)
     } catch (error) {
       await client.close()
-      if (launched?.child !== undefined) await disposeChild(launched.child).catch(() => undefined)
+      if (info.launched?.child !== undefined) await disposeChild(info.launched.child).catch(() => undefined)
       throw error
     }
   }
 
   /**
    * Create a fresh page target on an existing browser-level CDP connection and
-   * attach via the flattened session protocol. Used by both `connect()` (first
-   * attach) and the `connected-browser` state (after a tab was closed).
+   * attach via the flattened session protocol. Used by every connect path
+   * (first attach) and the `connected-browser` state (after a tab was closed).
    */
-  private async createTargetOnClient(client: CdpClient, launched: LaunchedChrome | undefined, signal?: AbortSignal): Promise<ActiveConnection> {
+  private async createTargetOnClient(
+    client: CdpClient,
+    info: { endpoint: string; browser?: string; launched?: LaunchedChrome },
+    signal?: AbortSignal,
+  ): Promise<ActiveConnection> {
     const created = await client.send('Target.createTarget', { url: 'about:blank' }, { signal }) as { targetId: string }
     const targetId = created.targetId
     const attached = await client.send('Target.attachToTarget', { targetId, flatten: true }, { signal }) as { sessionId: string }
@@ -229,7 +356,33 @@ export class ChromeRuntime extends Service {
     await client.send('Accessibility.enable', undefined, { sessionId, signal }).catch(() => undefined)
     this.trackNetwork(client, sessionId, network, observatory)
     this.trackConsole(client, sessionId, observatory)
-    return { client, targetId, sessionId, launched, network, observatory, readCursors, pageRefs }
+    this.trackDialogs(client, sessionId, observatory)
+    return { client, targetId, sessionId, endpoint: info.endpoint, browser: info.browser ?? '', launched: info.launched, network, observatory, readCursors, pageRefs }
+  }
+
+  /**
+   * Subscribe to `Page.javascriptDialogOpening` and answer each dialog per
+   * the configured policy. An unanswered dialog blocks every tool on the
+   * target, so auto-answering is what keeps automation alive; each opening
+   * (and how it was answered) is recorded into the observatory.
+   */
+  private trackDialogs(client: CdpClient, sessionId: string, observatory: Observatory): void {
+    const accept = this.config.dialogPolicy !== 'dismiss'
+    client.on('Page.javascriptDialogOpening', (raw: unknown) => {
+      const params = raw as { type?: string; message?: string; url?: string }
+      void client.send('Page.handleJavaScriptDialog', {
+        accept,
+        ...accept && this.config.dialogPromptText !== undefined ? { promptText: this.config.dialogPromptText } : {},
+      }, { sessionId }).catch(() => undefined)
+      observatory.recordDialog({
+        kind: params.type ?? 'alert',
+        message: params.message ?? '',
+        ...params.url !== undefined ? { url: params.url } : {},
+        response: accept ? 'accepted' : 'dismissed',
+        timestamp: Date.now(),
+      })
+    })
+    void sessionId
   }
 
   /**
@@ -695,7 +848,7 @@ export class ChromeRuntime extends Service {
       await active.client.send('Target.closeTarget', { targetId: active.targetId }, { signal })
     } finally {
       if (active.network.timer !== undefined) clearTimeout(active.network.timer)
-      this.state = { kind: 'connected-browser', client: active.client, launched: active.launched }
+      this.state = { kind: 'connected-browser', client: active.client, endpoint: active.endpoint, browser: active.browser, launched: active.launched }
     }
   }
 
@@ -937,8 +1090,10 @@ export class ChromeRuntime extends Service {
 
   /**
    * Close the entire browser: dispose the CDP connection and kill the child
-   * process (when the runtime owns it). After this, the next tool call
-   * re-launches a fresh Chrome if `launch: true`.
+   * process (when the runtime owns it — a reused instance is only detached).
+   * After this, the next tool call re-probes the debugger endpoint (attaching
+   * to an instance that is listening again when `reuseExisting` is on) or
+   * launches a fresh managed Chrome.
    */
   async closeBrowser(): Promise<void> {
     const previous = this.state
@@ -1093,17 +1248,8 @@ export function parseJsonString(value: unknown): unknown | undefined {
   }
 }
 
-/** Resolve a browser-level `webSocketDebuggerUrl` from a `ws://` or `http(s)://` endpoint. */
-async function resolveBrowserWsUrl(endpoint: string, signal?: AbortSignal): Promise<string> {
-  if (endpoint.startsWith('ws://') || endpoint.startsWith('wss://')) return endpoint
-  // Chrome ≥111 rejects DevTools HTTP requests whose Host header is not an
-  // IP; a `localhost` cdpUrl (especially behind a proxy) trips this, so poll by IP.
-  const version = await fetchVersionInfo(normalizeDebugEndpoint(endpoint.replace(/\/$/, '')), signal)
-  return version.webSocketDebuggerUrl
-}
-
 /** Poll a launched Chrome endpoint until ready, surfacing immediate child exit. */
-async function waitForReady(endpoint: string, timeoutMs: number, signal: AbortSignal | undefined, launched: LaunchedChrome): Promise<{ webSocketDebuggerUrl: string }> {
+async function waitForReady(endpoint: string, timeoutMs: number, signal: AbortSignal | undefined, launched: LaunchedChrome): Promise<ChromeVersionInfo> {
   const retries = Math.max(5, Math.floor(timeoutMs / 100))
   const exited = launched.child !== undefined
     ? new Promise<never>((_, reject) => {
@@ -1137,7 +1283,7 @@ async function waitForReady(endpoint: string, timeoutMs: number, signal: AbortSi
 }
 
 /** Retry `fetchVersionInfo` until success, abort, or budget exhaustion. */
-async function waitWithRetry(endpoint: string, retries: number, signal: AbortSignal | undefined): Promise<{ webSocketDebuggerUrl: string }> {
+async function waitWithRetry(endpoint: string, retries: number, signal: AbortSignal | undefined): Promise<ChromeVersionInfo> {
   let lastError: unknown
   for (let attempt = 0; attempt < retries; attempt++) {
     if (signal?.aborted) throw new ChromeError('Chrome endpoint wait aborted', 'CHROME_ABORTED')

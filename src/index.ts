@@ -8,7 +8,7 @@
  * `defineTool` consumers over it: `chrome_navigate`, `chrome_evaluate`,
  * `chrome_snapshot`, `chrome_page_snapshot`, `chrome_click`,
  * `chrome_screenshot`, `chrome_scroll`, `chrome_type`, `chrome_press_key`,
- * and `chrome_close`.
+ * `chrome_close`, and `chrome_connect` (choose reuse-vs-fresh-launch).
  *
  * Install into a profile with `dsh plugin --profile <name> add ./dsh-chrome`
  * (or `github:.../dsh-chrome`, a tarball, or the published package). See
@@ -32,6 +32,7 @@ import { applyChromeScrollTool } from './tools/scroll.ts'
 import { applyChromeTypeTool } from './tools/type.ts'
 import { applyChromePressKeyTool } from './tools/press-key.ts'
 import { applyChromeCloseTool } from './tools/close.ts'
+import { applyChromeConnectTool } from './tools/connect.ts'
 import { applyChromeNetTools } from './tools/net.ts'
 import { applyChromeConsoleTool } from './tools/console.ts'
 import { applyChromeEmulateTool } from './tools/emulate.ts'
@@ -47,7 +48,7 @@ export type {
   PageTreeSnapshotResult,
 } from './types.ts'
 export { ChromeRuntime, parseJsonString } from './service.ts'
-export type { ChromeRuntimeConfig } from './service.ts'
+export type { ChromeRuntimeConfig, ChromeConnectMode, ChromeConnectionInfo } from './service.ts'
 export {
   DEFAULT_PAGE_SNAPSHOT_MAX_NODES,
   normalizePageRef,
@@ -72,6 +73,7 @@ export {
   applyChromeTypeTool,
   applyChromePressKeyTool,
   applyChromeCloseTool,
+  applyChromeConnectTool,
   applyChromeNetTools,
   applyChromeConsoleTool,
   applyChromeEmulateTool,
@@ -131,6 +133,8 @@ export interface Config {
   pressKey?: boolean
   /** Register `chrome_close`. Defaults to true. */
   close?: boolean
+  /** Register `chrome_connect` (choose reuse vs. fresh launch). Defaults to true. */
+  connect?: boolean
   /** Register `chrome_net_list` / `chrome_net_body` (network observatory). Defaults to true. */
   netLog?: boolean
   /** Register `chrome_console_read` (console + exception capture). Defaults to true. */
@@ -149,6 +153,13 @@ export interface Config {
   launch?: boolean
   /** Existing CDP endpoint to attach to when `launch` is false (`ws://` or `http(s)://`). */
   cdpUrl?: string
+  /**
+   * Before launching on `port`, probe the debugger endpoint and reuse the
+   * instance already listening there instead of spawning a second Chrome over
+   * the same port. `false` = always launch fresh (the port must be free).
+   * Defaults to true. The agent can override per call via `chrome_connect`.
+   */
+  reuseExisting?: boolean
   /** Remote debugging port for a launched Chrome. Defaults to 9222. */
   port?: number
   /** Host a launched Chrome binds its endpoint on. Defaults to 127.0.0.1. */
@@ -163,6 +174,10 @@ export interface Config {
   operationTimeoutMs?: number
   /** Quiet window before `networkidle*` is declared (ms). Defaults to 500. */
   networkIdleMs?: number
+  /** How to answer JS dialogs (alert/confirm/prompt/beforeunload): "accept" (default) or "dismiss". */
+  dialogPolicy?: 'accept' | 'dismiss'
+  /** Prompt text sent when answering a `prompt` dialog under "accept". */
+  dialogPromptText?: string
   /** Cap on `chrome_snapshot` output characters. Defaults to 200000. */
   snapshotMaxChars?: number
   /** Cap on `chrome_page_snapshot` tree nodes. Defaults to 500. */
@@ -182,6 +197,7 @@ export const Config: z<Config> = z.object({
   type: z.boolean().default(true),
   pressKey: z.boolean().default(true),
   close: z.boolean().default(true),
+  connect: z.boolean().default(true),
   netLog: z.boolean().default(true),
   consoleLog: z.boolean().default(true),
   emulate: z.boolean().default(true),
@@ -191,6 +207,9 @@ export const Config: z<Config> = z.object({
   executablePath: z.string(),
   launch: z.boolean().default(true),
   cdpUrl: z.string(),
+  reuseExisting: z.boolean().default(true),
+  dialogPolicy: z.union([z.const('accept'), z.const('dismiss')]).default('accept'),
+  dialogPromptText: z.string(),
   port: z.number().default(DEFAULT_CHROME_PORT),
   host: z.string().default('127.0.0.1'),
   headless: z.union([z.boolean(), z.const('new')]).default('new'),
@@ -220,6 +239,7 @@ type ResolvedConfig = {
   type: boolean
   pressKey: boolean
   close: boolean
+  connect: boolean
   netLog: boolean
   consoleLog: boolean
   emulate: boolean
@@ -229,6 +249,9 @@ type ResolvedConfig = {
   executablePath: string | undefined
   launch: boolean
   cdpUrl: string | undefined
+  reuseExisting: boolean
+  dialogPolicy: 'accept' | 'dismiss'
+  dialogPromptText: string | undefined
   port: number
   host: string
   headless: boolean | 'new'
@@ -247,6 +270,9 @@ function runtimeConfig(config: ResolvedConfig): ChromeRuntimeConfig {
     ...config.executablePath !== undefined && config.executablePath.length > 0 ? { executablePath: config.executablePath } : {},
     launch: config.launch,
     ...config.cdpUrl !== undefined && config.cdpUrl.length > 0 ? { cdpUrl: config.cdpUrl } : {},
+    reuseExisting: config.reuseExisting,
+    ...config.dialogPolicy !== undefined ? { dialogPolicy: config.dialogPolicy } : {},
+    ...config.dialogPromptText !== undefined && config.dialogPromptText.length > 0 ? { dialogPromptText: config.dialogPromptText } : {},
     port: config.port,
     host: config.host,
     headless: config.headless,
@@ -303,7 +329,7 @@ export function apply(ctx: Context, config: Config): void {
   ctx.systemPrompt.section({
     name: 'chrome:overview',
     order: 109,
-    text: 'The chrome_* tools drive a real Chrome browser over the DevTools Protocol. They can run arbitrary JavaScript, read rendered content, click elements, and capture screenshots in the controlled page. Treat them like shell access: they reach the network and run untrusted page code. To understand a page, prefer chrome_page_snapshot (structured element tree with [ref=eN] ids you can act on) or chrome_snapshot (visible text); chrome_screenshot needs an image-capable route or a configured screenshotAnalysis model.',
+    text: 'The chrome_* tools drive a real Chrome browser over the DevTools Protocol. They can run arbitrary JavaScript, read rendered content, click elements, and capture screenshots in the controlled page. Treat them like shell access: they reach the network and run untrusted page code. To understand a page, prefer chrome_page_snapshot (structured element tree with [ref=eN] ids you can act on) or chrome_snapshot (visible text); chrome_screenshot needs an image-capable route or a configured screenshotAnalysis model. Before launching, an instance already listening on the debugger port is reused; chrome_connect switches explicitly between reuse ("reuse"/"auto") and a fresh managed instance ("launch").',
   })
 
   if (resolved.navigate) applyChromeNavigateTool(ctx, chrome, resolved.operationTimeoutMs)
@@ -316,6 +342,7 @@ export function apply(ctx: Context, config: Config): void {
   if (resolved.type) applyChromeTypeTool(ctx, chrome, resolved.operationTimeoutMs)
   if (resolved.pressKey) applyChromePressKeyTool(ctx, chrome, resolved.operationTimeoutMs)
   if (resolved.close) applyChromeCloseTool(ctx, chrome, resolved.operationTimeoutMs)
+  if (resolved.connect) applyChromeConnectTool(ctx, chrome, resolved.operationTimeoutMs)
   if (resolved.netLog) applyChromeNetTools(ctx, chrome, resolved.operationTimeoutMs)
   if (resolved.consoleLog) applyChromeConsoleTool(ctx, chrome, resolved.operationTimeoutMs)
   if (resolved.emulate) applyChromeEmulateTool(ctx, chrome, resolved.operationTimeoutMs)

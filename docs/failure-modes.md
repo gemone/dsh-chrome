@@ -20,10 +20,12 @@ bare timeout) so the fix is one step away.
 
 | Error | Cause | Plugin behavior | Operator action |
 |---|---|---|---|
-| `CHROME_ENDPOINT_UNREACHABLE` | Slow endpoint open; wrong `host`/`port`; port owned by another process. | **[fixed]** Launch polls `/json/version` with a budget derived from `operationTimeoutMs`; a busy/occupied port surfaces via the child-exit path with output. | Align `host`/`port`; free the port. |
-| HTTP 403 from `/json/version` | Chrome ≥111 rejects DevTools requests whose `Host` header is not an IP (proxying `localhost`). | **[fixed]** `localhost` is rewritten to `127.0.0.1` in every debug endpoint — the launched endpoint, `cdpUrl` HTTP discovery, and `ws://` URLs alike. | — |
-| No `webSocketDebuggerUrl` | Target Chrome has no debugging port, or the URL points at a page endpoint. | **[diagnosed]** Distinct error names the endpoint. | Launch Chrome with `--remote-debugging-port`, or point `cdpUrl` at the browser-level `ws://…/devtools/browser/<id>`. |
-| `CDP socket closed` / connect failed | Browser crashed, remote Chrome restarted, too many clients. | **[fixed]** A dead socket is detected lazily and the next tool call reconnects (launch mode respawns Chrome). Refs from `chrome_page_snapshot` are dropped on reconnection by design. | Retry; take a fresh `chrome_page_snapshot` before acting by ref. |
+| `CHROME_ENDPOINT_UNREACHABLE` | Slow endpoint open; wrong `host`/`port`. | **[fixed]** Launch polls `/json/version` with a budget derived from `operationTimeoutMs`. | Align `host`/`port`. |
+| `CHROME_ENDPOINT_UNREACHABLE` — `no Chrome debugger is listening on …` | `chrome_connect { "mode": "reuse" }` (or an attach) found nothing on the debugger port. | **[fixed]** The error names the endpoint and offers the alternatives: start Chrome with `--remote-debugging-port`, or connect with mode `"auto"`/`"launch"`. | Start Chrome, or let the plugin launch. |
+| Debugger port already served | An instance the plugin does not own still serves `port` when a fresh launch was requested (`chrome_connect { "mode": "launch" }`, or `reuseExisting: false` with the port busy). | **[fixed]** The preflight probe (two attempts, covering a Chrome still binding its port) catches the occupied port **before spawning** a doomed second Chrome; `mode: "launch"` first closes the current connection — a managed Chrome is killed and its port freed, so only a *foreign* instance keeps the port serving. The error reports the version already serving and suggests mode `"auto"`/`"reuse"`, or freeing the port / picking another `port`. | Attach via `chrome_connect`/`reuseExisting`, or free the port. |
+| HTTP 403 from `/json/version` | Chrome ≥111 rejects DevTools requests whose `Host` header is not an IP (proxying `localhost`). | **[fixed]** `localhost` is rewritten to `127.0.0.1` in every debug endpoint — the launched endpoint, the reuse probe, `cdpUrl` HTTP discovery, and `ws://` URLs alike. | — |
+| No `webSocketDebuggerUrl` | Target Chrome has no debugging port, or the URL points at a page endpoint. | **[diagnosed]** Distinct error names the endpoint; a non-CDP HTTP service on the port is treated as "nothing listening" by the reuse probe. | Launch Chrome with `--remote-debugging-port`, or point `cdpUrl` at the browser-level `ws://…/devtools/browser/<id>`. |
+| `CDP socket closed` / connect failed | Browser crashed, remote Chrome restarted, too many clients. | **[fixed]** A dead socket is detected lazily and the next tool call reconnects — launch mode respawns Chrome; with `reuseExisting` the port is probed again first, attaching to a replacement instance when one is listening. Refs from `chrome_page_snapshot` are dropped on reconnection by design. | Retry; take a fresh `chrome_page_snapshot` before acting by ref. |
 
 ## 3. Page / protocol failures during tool calls
 
@@ -67,9 +69,18 @@ history the current route must be able to carry.
   converter emits an `<!-- iframe: src -->` marker so the reader knows content
   exists beyond the conversion; `chrome_page_snapshot` covers the top frame.
 - **Two plugins racing one Chrome** — same `port`/`userDataDir` collides; the
-  launch error now names the real conflict. Give each instance its own.
+  preflight and launch errors name the real conflict. Give each instance its
+  own — or let the default `reuseExisting` behavior make the second plugin
+  attach to the first one's instance instead of colliding.
 - **Configured `userDataDir` persists cookies/storage** across runs; the
   default fresh temp profile starts clean every launch.
+- **Reused instances are shared, not owned** — when the plugin attaches to an
+  instance already on the debugger port, other clients (a human's DevTools,
+  another automation) drive the same browser; navigations and page targets are
+  visible to them, and the instance outlives the plugin. If a socket dies and
+  a *different* Chrome has taken over the port in the meantime, the implicit
+  reconnect attaches to that newcomer — `chrome_connect` is the way to ask
+  which browser is currently being driven.
 
 ## 6. Stability features always on
 
@@ -78,7 +89,10 @@ history the current route must be able to carry.
   `CHROME_TIMEOUT`, `CHROME_ABORTED`) so automation can branch by category.
 - Launch races the child's `exit` against endpoint polling — a dead Chrome
   fails fast with its real output instead of a generic timeout.
-- Dead sockets reconnect lazily; launch mode respawns Chrome automatically.
+- Dead sockets reconnect lazily; launch mode respawns Chrome automatically
+  (the reuse probe runs first, so a replacement instance on the port wins).
+- Debugger-port reuse is attach-only: a reused instance is never killed by
+  dispose, `chrome_close { "what": "browser" }`, or plugin unload.
 - Navigation waits are event-based with network-idle accounting; the caller's
   abort signal is honored at every stage.
 - Screenshot gates (route capability, attachment service, media type, analysis

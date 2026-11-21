@@ -5,7 +5,7 @@ import ToolRuntime from '@deepseek-ai/dsh-tools'
 import { apply, Config, name, inject } from '../src/index.ts'
 import { ChromeRuntime } from '../src/service.ts'
 
-const EXPECTED_TOOLS = ['chrome_navigate', 'chrome_evaluate', 'chrome_snapshot', 'chrome_page_snapshot', 'chrome_click', 'chrome_screenshot', 'chrome_scroll', 'chrome_type', 'chrome_press_key', 'chrome_close', 'chrome_net_list', 'chrome_net_body', 'chrome_console_read', 'chrome_emulate', 'chrome_pdf', 'chrome_storage']
+const EXPECTED_TOOLS = ['chrome_navigate', 'chrome_evaluate', 'chrome_snapshot', 'chrome_page_snapshot', 'chrome_click', 'chrome_screenshot', 'chrome_scroll', 'chrome_type', 'chrome_press_key', 'chrome_close', 'chrome_connect', 'chrome_net_list', 'chrome_net_body', 'chrome_console_read', 'chrome_emulate', 'chrome_pdf', 'chrome_storage']
 
 async function setup() {
   const ctx = new Context()
@@ -64,6 +64,22 @@ describe('plugin integration with the DSH registries', () => {
   it('rejects connect mode without a cdpUrl', async () => {
     const ctx = await setup()
     expect(() => apply(ctx, Config({ launch: false }))).toThrow(/cdpUrl/)
+  })
+
+  it('defaults to reusing an existing debugger-port instance and registers chrome_connect', async () => {
+    expect(Config({}).reuseExisting).toBe(true)
+    const ctx = await setup()
+    apply(ctx, Config({}))
+    const names = ctx.tools.schemas().map(schema => schema.name)
+    expect(names).toContain('chrome_connect')
+  })
+
+  it('respects the chrome_connect enable flag', async () => {
+    const ctx = await setup()
+    apply(ctx, Config({ connect: false }))
+    const names = ctx.tools.schemas().map(schema => schema.name)
+    expect(names).not.toContain('chrome_connect')
+    expect(names).toContain('chrome_close')
   })
 
   it('rejects a partially configured screenshotAnalysis section', async () => {

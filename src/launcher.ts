@@ -250,6 +250,36 @@ export async function fetchVersionInfo(endpoint: string, signal?: AbortSignal): 
 }
 
 /**
+ * Probe whether a Chrome debugger is already serving an endpoint, treating a
+ * miss as data rather than an error. This is the reuse preflight: before
+ * spawning a managed Chrome, the configured debug port is asked whether an
+ * instance already listens there, so the running instance can be attached to
+ * instead of launching a second one over the same port.
+ *
+ * @param endpoint - `http(s)://host:port` base URL.
+ * @param signal - optional cancellation.
+ * @returns the version info when a debugger answers, `undefined` when nothing
+ * usable responds (nothing listening, non-CDP HTTP service, bad payload).
+ * @throws {ChromeError} `CHROME_ABORTED` when the caller cancelled the probe.
+ */
+export async function probeExistingEndpoint(endpoint: string, signal?: AbortSignal): Promise<ChromeVersionInfo | undefined> {
+  // Two attempts: a Chrome that is still starting binds its debug port late,
+  // so a single miss could race an instance mid-startup and spawn a doomed
+  // second Chrome over it. One short retry buys that window cheaply.
+  for (let attempt = 0; attempt < 2; attempt++) {
+    try {
+      return await fetchVersionInfo(endpoint, signal)
+    } catch (error) {
+      if (signal?.aborted) {
+        throw new ChromeError('Chrome endpoint probe aborted', 'CHROME_ABORTED', { cause: error })
+      }
+      if (attempt === 0) await new Promise<void>(resolve => setTimeout(resolve, 400))
+    }
+  }
+  return undefined
+}
+
+/**
  * Poll a Chrome endpoint until `/json/version` responds or the attempt budget
  * is exhausted.
  *

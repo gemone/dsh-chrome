@@ -2,7 +2,7 @@
 
 A [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) plugin that gives the agent model-facing tools to drive a **real Chrome browser** over the **Chrome DevTools Protocol (CDP)**.
 
-10 tools covering navigation, JS execution, page reading (text and structured), clicking, scrolling, typing, keyboard input, screenshots, and tab/browser lifecycle — a complete browser automation surface for AI agents.
+17 tools covering connection control, navigation, JS execution, page reading (text and structured), clicking, scrolling, typing, keyboard input, screenshots, and tab/browser lifecycle — a complete browser automation surface for AI agents.
 
 > Authoring follows the DSH [adding-a-tool](https://deepseek-harness.github.io/deepseek-harness/reference/cookbook/adding-a-tool) and [plugin packaging](https://deepseek-harness.github.io/deepseek-harness/reference/user/develop/basic/publish) guides. Tools are defined with `defineTool`; the Chrome lifecycle lives in a `ctx.chrome` Cordis `Service`.
 
@@ -10,6 +10,7 @@ A [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) plugin tha
 
 | Tool | What it does | CDP |
 |---|---|---|
+| `chrome_connect` | Ensure a browser connection and report which instance serves it. `mode` chooses the strategy: `"auto"` (default) reuses an instance already listening on the debugger port, launching fresh only when none is; `"reuse"` attaches only to an existing instance; `"launch"` replaces the connection with a fresh managed instance. | `/json/version` probe + `Target.*` |
 | `chrome_navigate` | Open a URL, wait for a lifecycle event (`load`/`domcontentloaded`/`networkidle0`/`networkidle2`). Returns final URL + title. | `Page.navigate` |
 | `chrome_evaluate` | Evaluate JS, return JSON value. Exceptions returned as `exceptionDetails` (not an error). | `Runtime.evaluate` |
 | `chrome_snapshot` | Read the page, bounded: `format: "text"` returns the rendered visible text; `format: "markdown"` converts the page to GitHub-flavored Markdown (headings, links, lists, tables, code blocks). | `Runtime.evaluate` |
@@ -19,7 +20,7 @@ A [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) plugin tha
 | `chrome_scroll` | Scroll page by pixel amount or scroll an element (selector or ref) into view. | `Runtime.evaluate` |
 | `chrome_type` | Type text via real keyboard events (`Input.insertText`), optionally focusing a selector/ref first. React/Vue/Angular-friendly. | `Input.insertText` |
 | `chrome_press_key` | Press a special key: Enter, Tab, Escape, arrows, F1–F12, etc. | `Input.dispatchKeyEvent` |
-| `chrome_close` | Close current tab (`Target.closeTarget`, browser stays alive) or entire browser (kill process). Auto-reconnects on next call. | `Target.closeTarget` / dispose |
+| `chrome_close` | Close current tab (`Target.closeTarget`, browser stays alive) or entire browser. Closing the browser kills the Chrome process the plugin launched; a reused (attached) instance is only detached. Auto-reconnects on next call. | `Target.closeTarget` / dispose |
 | `chrome_net_list` | List the network requests the page made since the session connected (URL, method, status, resource type, failures). `failedOnly: true` filters to failures. | `Network.*` events |
 | `chrome_net_body` | Read one captured response body by `requestId` (base64-decoded, bounded). Chrome evicts bodies as the page proceeds — fetch promptly. | `Network.getResponseBody` |
 | `chrome_console_read` | Read console output: `console.*` calls, uncaught exceptions, browser log entries (CSP, failed loads). `level` filters by severity (default `error`); `all: true` dumps the buffer. | `Runtime`/`Log` events |
@@ -95,8 +96,9 @@ All options live under the `chrome-tool:` section. Every field is optional with 
 | Option | Default | Description |
 |---|---|---|
 | `executablePath` | discovered | Chrome/Chromium path. Env `DSH_CHROME_EXECUTABLE_PATH` → well-known paths → PATH. |
-| `launch` | `true` | Launch a managed Chrome. `false` = attach to `cdpUrl`. |
+| `launch` | `true` | Launch a managed Chrome. `false` = attach to `cdpUrl` only. |
 | `cdpUrl` | — | Existing CDP endpoint when `launch: false` (`ws://…` or `http(s)://…`). Required when `launch` is false. |
+| `reuseExisting` | `true` | Before launching on `port`, probe the debugger endpoint and **reuse the instance already listening** instead of spawning a second Chrome over the same port. `false` = always launch fresh (the port must be free). The agent can override per call via `chrome_connect`. |
 | `port` | `9222` | Remote debugging port. |
 | `host` | `127.0.0.1` | Chrome debug endpoint host. |
 | `headless` | `"new"` | `true` (old headless), `"new"`, or `false` (visible window). |
@@ -107,7 +109,7 @@ All options live under the `chrome-tool:` section. Every field is optional with 
 | `snapshotMaxChars` | `200000` | Cap on `chrome_snapshot` output. |
 | `pageSnapshotMaxNodes` | `500` | Cap on `chrome_page_snapshot` tree nodes. |
 | `screenshotAnalysis` | — | `{ provider, model, prompt?, maxTokens? }`: an image-capable route that describes screenshots in text when the agent's own route cannot see images. See below. |
-| `navigate` / `evaluate` / `snapshot` / `pageSnapshot` / `click` / `screenshot` / `scroll` / `type` / `pressKey` / `close` | `true` | Enable/disable individual tools. |
+| `navigate` / `evaluate` / `snapshot` / `pageSnapshot` / `click` / `screenshot` / `scroll` / `type` / `pressKey` / `close` / `connect` | `true` | Enable/disable individual tools. |
 
 Example profile patch (`cordis.patch.yml`):
 
@@ -121,11 +123,46 @@ Example profile patch (`cordis.patch.yml`):
 
 Config edits to `cordis.patch.yml` hot-apply — no profile restart needed (DSH watches the file transactionally).
 
-### Connect to an already-running Chrome
+### Reuse an already-running Chrome (debugger port)
+
+The plugin can attach to a Chrome that is **already** exposing a DevTools
+endpoint instead of spawning a second instance over the same port. Start
+Chrome with remote debugging:
 
 ```sh
 google-chrome --remote-debugging-port=9222 --user-data-dir=/tmp/chrome-debug
 ```
+
+Then just use the plugin with its default config — before launching, the
+debugger port (`host` + `port`) is probed via `/json/version`, and an instance
+already listening there is reused (attach-only: it is never killed on dispose
+or `chrome_close { "what": "browser" }`). Nothing listening → a managed Chrome
+launches as before. Set `reuseExisting: false` to always launch fresh.
+
+```yaml
+- id: chrome-tool
+  config:
+    port: 9222               # the port the existing Chrome listens on
+    # reuseExisting: true    # default; false restores always-launch
+```
+
+#### Letting the agent choose
+
+`chrome_connect` makes the strategy explicit per call:
+
+| `mode` | Behavior |
+|---|---|
+| `"auto"` (default) | Reuse the instance on the debugger port when one is listening; launch a managed Chrome otherwise. |
+| `"reuse"` | Attach only — fails with `CHROME_ENDPOINT_UNREACHABLE` when nothing is listening. |
+| `"launch"` | Replace the connection with a fresh managed instance — a connection the plugin owns is closed (its Chrome killed) first; fails with `CHROME_LAUNCH_FAILED` when the port is still served by an instance the plugin does not own. |
+
+The result reports `connected: "attached" | "launched"`, the `endpoint`, the
+browser version, and the page `targetId`, so the agent knows whether it is
+driving a reused instance or one it owns.
+
+An explicit `cdpUrl` (attach mode) still works exactly as before; in that mode
+`chrome_connect { "mode": "launch" }` is refused because the deployment
+disabled launching.
 
 ```yaml
 - id: chrome-tool
@@ -204,14 +241,14 @@ Driving a real browser is **shell-equivalent power**: it can reach the local net
 ```
 src/
 ├── index.ts          plugin entry: name/inject/Config(schemastery)/apply
-├── service.ts        ChromeRuntime Service → ctx.chrome (lifecycle + CDP orchestration)
+├── service.ts        ChromeRuntime Service → ctx.chrome (lifecycle + CDP orchestration, attach-or-launch)
 ├── cdp.ts            CDP client over ws (flattened sessions, abort-aware)
-├── launcher.ts       executable discovery, Chrome spawn, /json/version polling
+├── launcher.ts       executable discovery, Chrome spawn, /json/version polling + reuse probe
 ├── page-walker.ts    in-page DOM walker: element tree + [ref=eN] → selector map
 ├── markdown.ts       in-page DOM→Markdown converter (chrome_snapshot format)
 ├── analysis.ts       one-shot vision-model call that describes a saved screenshot
 ├── types.ts          error codes + shared types
-└── tools/            10 defineTool consumers
+└── tools/            17 defineTool consumers
     ├── navigate.ts     chrome_navigate
     ├── evaluate.ts     chrome_evaluate
     ├── snapshot.ts     chrome_snapshot (text)
@@ -224,10 +261,12 @@ src/
     ├── ref-target.ts   shared selector/ref argument resolution
     ├── net.ts          chrome_net_list / chrome_net_body (Network events + getResponseBody)
     ├── console.ts      chrome_console_read (Runtime/Log events)
-    └── close.ts        chrome_close (Target.closeTarget / dispose)
+    ├── close.ts        chrome_close (Target.closeTarget / dispose)
+    └── connect.ts      chrome_connect (reuse-vs-launch choice)
 ```
 
 - **One bundle, provider-shaped seam.** `ChromeRuntime` is `ctx.chrome`; its interface allows a future split into capability seam + provider + consumer (mirroring `ctx.web`).
+- **Attach-or-launch connect.** Before spawning, the configured debugger port is probed (`/json/version`): an instance already listening is reused — attach-only, never killed by dispose or `chrome_close` — otherwise a managed Chrome launches. `chrome_connect` lets the model pick the strategy explicitly (`auto`/`reuse`/`launch`).
 - **Flattened CDP sessions.** One browser-level WebSocket drives a page target via `Target.attachToTarget({ flatten: true })`.
 - **Connected-browser state.** After `closeTab()`, the browser connection stays alive; the next tool call auto-creates a fresh page target — no Chrome restart needed.
 - **Ephemeral page refs.** `chrome_page_snapshot` keeps a `ref → selector` map inside the runtime; navigation clears it, and ref-based tools fail loudly on stale ids.

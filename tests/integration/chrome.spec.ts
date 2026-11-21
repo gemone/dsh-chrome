@@ -56,6 +56,7 @@ describe.skipIf(!runnable)('ChromeRuntime against a real Chrome', { timeout: 60_
     const ctx = new Context()
     chrome = new ChromeRuntime(ctx, {
       launch: true,
+      reuseExisting: true,
       port: debugPort,
       host: '127.0.0.1',
       headless: 'new',
@@ -216,5 +217,76 @@ describe.skipIf(!runnable)('ChromeRuntime against a real Chrome', { timeout: 60_
   it('runs a raw CDP passthrough on the page session', async () => {
     const res = await chrome.cdp({ method: 'Runtime.evaluate', params: { expression: '40 + 2', returnByValue: true } }) as { result?: { value?: number } }
     expect(res.result?.value).toBe(42)
+  })
+})
+
+describe.skipIf(!runnable)('debugger-port reuse against a real Chrome', { timeout: 90_000 }, () => {
+  /** Runtime config for launch mode against a specific port. */
+  function config(port: number): Parameters<typeof ChromeRuntime>[1] {
+    return {
+      launch: true,
+      reuseExisting: true,
+      port,
+      host: '127.0.0.1',
+      headless: 'new',
+      extraArgs: [],
+      operationTimeoutMs: 30_000,
+      networkIdleMs: 300,
+    }
+  }
+
+  it('launches on a free port, replaces its own instance, then other runtimes reuse the port', async () => {
+    const debugPort = await freePort()
+    const a = new ChromeRuntime(new Context(), config(debugPort))
+    try {
+      // Nothing is listening yet: "auto" falls through to a managed launch.
+      const first = await a.ensureConnection('auto')
+      expect(first.connected).toBe('launched')
+      expect(first.endpoint).toBe(`http://127.0.0.1:${debugPort}`)
+      expect(first.browser).toContain('Chrome')
+      expect(a.ownsBrowserProcess).toBe(true)
+
+      // "launch" replaces a connection the runtime owns: the old Chrome is
+      // killed (freeing the port) and a fresh one starts in its place.
+      const replaced = await a.ensureConnection('launch')
+      expect(replaced.connected).toBe('launched')
+      expect(replaced.endpoint).toBe(first.endpoint)
+      expect(replaced.targetId).not.toBe(first.targetId)
+      expect(a.ownsBrowserProcess).toBe(true)
+
+      // A second runtime on the same port must not spawn over the occupied port…
+      const b = new ChromeRuntime(new Context(), config(debugPort))
+      try {
+        await expect(b.ensureConnection('launch')).rejects.toMatchObject({ code: 'CHROME_LAUNCH_FAILED', message: /already serving/ })
+        // …and "reuse" attaches instead.
+        const second = await b.ensureConnection('reuse')
+        expect(second.connected).toBe('attached')
+        expect(second.endpoint).toBe(first.endpoint)
+        expect(b.ownsBrowserProcess).toBe(false)
+      } finally {
+        // Detaching must not kill the browser A launched.
+        await b.dispose()
+      }
+
+      // The reused instance is still serving after B detached.
+      const c = new ChromeRuntime(new Context(), config(debugPort))
+      try {
+        const third = await c.ensureConnection('auto')
+        expect(third.connected).toBe('attached')
+        expect(third.targetId).not.toBe(replaced.targetId)
+      } finally {
+        await c.dispose()
+      }
+    } finally {
+      // Disposing the owner terminates the Chrome child.
+      await a.dispose()
+    }
+    // After the owner is gone, the port is free again: reuse finds nothing.
+    const d = new ChromeRuntime(new Context(), config(debugPort))
+    try {
+      await expect(d.ensureConnection('reuse')).rejects.toMatchObject({ code: 'CHROME_ENDPOINT_UNREACHABLE' })
+    } finally {
+      await d.dispose()
+    }
   })
 })

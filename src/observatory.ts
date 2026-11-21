@@ -58,12 +58,12 @@ export interface NetEntry {
   redirects?: number
 }
 
-/** One console message, uncaught exception, or browser log entry. */
+/** One console message, uncaught exception, browser log, or JS dialog. */
 export interface ConsoleEntry {
   /** Monotonic sequence number, stable across the whole connection. */
   index: number
   /** Where it came from. */
-  source: 'console' | 'exception' | 'browser-log'
+  source: 'console' | 'exception' | 'browser-log' | 'dialog'
   /** Severity; exceptions and failed browser logs map to `error`. */
   level: ConsoleLevel
   /** One-line human-readable text (bounded). */
@@ -269,6 +269,28 @@ export class Observatory {
       timestamp: params.timestamp,
       ...params.url !== undefined ? { url: params.url } : {},
       ...params.lineNumber !== undefined ? { lineNumber: params.lineNumber } : {},
+    })
+  }
+
+  /**
+   * Record one JS dialog (alert/confirm/prompt/beforeunload) opening, plus
+   * how the runtime answered it. Pure recording; the answering lives in the
+   * service's event handler.
+   */
+  recordDialog(params: {
+    kind: string
+    message: string
+    url?: string
+    response: 'accepted' | 'dismissed'
+    timestamp: number
+  }): void {
+    this.pushConsole({
+      index: this.consoleCursor++,
+      source: 'dialog',
+      level: 'warning',
+      text: `${params.kind} dialog ${params.response}: ${params.message}`,
+      timestamp: params.timestamp,
+      ...params.url !== undefined && params.url.length > 0 ? { url: params.url } : {},
     })
   }
 
