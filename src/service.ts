@@ -338,9 +338,15 @@ export class ChromeRuntime extends Service {
     client: CdpClient,
     info: { endpoint: string; browser?: string; launched?: LaunchedChrome },
     signal?: AbortSignal,
+    existingTargetId?: string,
   ): Promise<ActiveConnection> {
-    const created = await client.send('Target.createTarget', { url: 'about:blank' }, { signal }) as { targetId: string }
-    const targetId = created.targetId
+    let targetId: string
+    if (existingTargetId !== undefined) {
+      targetId = existingTargetId
+    } else {
+      const created = await client.send('Target.createTarget', { url: 'about:blank' }, { signal }) as { targetId: string }
+      targetId = created.targetId
+    }
     const attached = await client.send('Target.attachToTarget', { targetId, flatten: true }, { signal }) as { sessionId: string }
     const sessionId = attached.sessionId
     const network: NetworkState = { inflight: new Set() }
@@ -980,6 +986,88 @@ export class ChromeRuntime extends Service {
       fileCount: options.paths.length,
       ...info.coveredBy !== undefined && info.coveredBy !== null ? { coveredBy: info.coveredBy } : {},
     }
+  }
+
+  /**
+   * List the browser's page tabs (browser-level `Target.getTargets`, page
+   * type only) with `attached` marking the tab the tools currently drive.
+   */
+  async listTabs(signal?: AbortSignal): Promise<Array<{ index: number; targetId: string; url: string; title: string; attached: boolean }>> {
+    const active = await this.ensure(signal)
+    const targets = await active.client.send('Target.getTargets', undefined, { signal }) as {
+      targetInfos?: Array<{ targetId: string; type: string; url: string; title: string }>
+    }
+    const pages = (targets.targetInfos ?? []).filter(t => t.type === 'page')
+    return pages.map((t, index) => ({
+      index,
+      targetId: t.targetId,
+      url: t.url,
+      title: t.title,
+      attached: t.targetId === active.targetId,
+    }))
+  }
+
+  /**
+   * Open a new tab (default `about:blank`) and switch the tools to drive it.
+   * The previous tab stays alive in the background.
+   */
+  async openTab(url: string | undefined, signal?: AbortSignal): Promise<{ targetId: string; url: string; title: string }> {
+    const active = await this.ensure(signal)
+    const created = await active.client.send('Target.createTarget', {
+      url: url !== undefined && url.length > 0 ? url : 'about:blank',
+    }, { signal }) as { targetId: string }
+    await this.switchToTarget(created.targetId, signal)
+    const meta = await this.evaluate('JSON.stringify({ url: location.href, title: document.title })', { signal })
+    const parsed = parseJsonString(meta.result) as { url?: string; title?: string } | undefined
+    return { targetId: created.targetId, url: parsed?.url ?? url ?? 'about:blank', title: parsed?.title ?? '' }
+  }
+
+  /**
+   * Switch the tools to drive a different tab, by zero-based list index (as
+   * reported by `listTabs`) or by target id. The previously driven tab stays
+   * alive; observatory buffers are per-tab, so counts reset on switch.
+   */
+  async switchTab(options: { index?: number; targetId?: string; signal?: AbortSignal }): Promise<{ targetId: string; url: string; title: string }> {
+    const active = await this.ensure(options.signal)
+    const targets = await active.client.send('Target.getTargets', undefined, { signal: options.signal }) as {
+      targetInfos?: Array<{ targetId: string; type: string; url: string; title: string }>
+    }
+    const pages = (targets.targetInfos ?? []).filter(t => t.type === 'page')
+    let targetId: string | undefined
+    if (options.targetId !== undefined && options.targetId.length > 0) {
+      targetId = pages.find(t => t.targetId === options.targetId)?.targetId
+      if (targetId === undefined) {
+        throw new ChromeError(`no page tab with targetId ${options.targetId}`, 'CHROME_CDP_ERROR')
+      }
+    } else if (options.index !== undefined) {
+      const found = pages[options.index]
+      if (found === undefined) {
+        throw new ChromeError(`no page tab at index ${options.index} (${pages.length} tab(s) open)`, 'CHROME_CDP_ERROR')
+      }
+      targetId = found.targetId
+    } else {
+      throw new ChromeError('switchTab requires either index or targetId', 'CHROME_CDP_ERROR')
+    }
+    if (targetId === active.targetId) {
+      const current = pages.find(t => t.targetId === targetId)
+      return { targetId, url: current?.url ?? '', title: current?.title ?? '' }
+    }
+    const info = await this.switchToTarget(targetId, options.signal)
+    return { targetId, url: info.url, title: info.title }
+  }
+
+  /** Attach to an existing page target and make it the driven tab. */
+  private async switchToTarget(targetId: string, signal?: AbortSignal): Promise<{ url: string; title: string }> {
+    if (this.state.kind !== 'connected') {
+      throw new ChromeError('cannot switch tabs without a live connection', 'CHROME_CDP_ERROR')
+    }
+    const { client } = this.state.active
+    const info = { endpoint: this.state.active.endpoint, browser: this.state.active.browser, launched: this.state.active.launched }
+    const attached = await this.createTargetOnClient(client, info, signal, targetId)
+    this.state = { kind: 'connected', active: attached }
+    const meta = await this.evaluate('JSON.stringify({ url: location.href, title: document.title })', { signal })
+    const parsed = parseJsonString(meta.result) as { url?: string; title?: string } | undefined
+    return { url: parsed?.url ?? '', title: parsed?.title ?? '' }
   }
 
   /**
