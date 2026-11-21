@@ -142,6 +142,13 @@ describe('Observatory console recording', () => {
 })
 
 describe('Observatory unread hints', () => {
+  it('counts download lifecycle entries as unread activity (README promises hint coverage)', () => {
+    const obs = new Observatory()
+    obs.recordDownload({ state: 'completed', filename: 'report.bin', path: '/tmp/report.bin', receivedBytes: 10, totalBytes: 10, timestamp: 1 })
+    expect(obs.unread(0, 0).consoleEntries).toBe(1)
+    expect(formatActivityHint(obs.unread(0, 0))).toContain('chrome_console_read')
+  })
+
   it('counts unread console errors and failed requests per cursors', () => {
     const obs = new Observatory()
     obs.recordConsole({ type: 'error', args: [{ type: 'string', value: 'e1' }], timestamp: 1 })

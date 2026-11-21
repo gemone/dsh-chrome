@@ -359,7 +359,7 @@ export class Observatory {
     return {
       consoleEntries: this.consoleEntries.filter(entry =>
         entry.index >= consoleReadIndex
-        && (entry.level === 'error' || entry.source === 'dialog'),
+        && (entry.level === 'error' || entry.source === 'dialog' || entry.source === 'download'),
       ).length,
       failedRequests: this.netEntries.filter(entry => entry.failed === true && entry.seq >= netReadIndex).length,
     }

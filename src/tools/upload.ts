@@ -56,6 +56,8 @@ export function applyChromeUploadTool(ctx: Context, chrome: ChromeRuntime, timeo
       ],
     },
     timeoutMs,
+    // Mutates the page's file input DOM; keep it exclusive.
+    isConcurrencySafe: () => false,
     async execute(args, exec) {
       const selector = resolveTargetSelector(chrome, args)
       return await chrome.upload({

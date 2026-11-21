@@ -49,6 +49,8 @@ export function applyChromeNetMockTool(ctx: Context, chrome: ChromeRuntime, time
       render: (_args, value): ContentBlock[] => [{ type: 'text', text: value.text }],
     },
     timeoutMs,
+    // Mutates connection-wide Fetch interception; keep it exclusive.
+    isConcurrencySafe: () => false,
     async execute(args, exec) {
       if (args.action === 'clear') {
         const { cleared } = await chrome.netMockClear(exec.signal)

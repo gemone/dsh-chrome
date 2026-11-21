@@ -21,6 +21,7 @@ import z from '@deepseek-ai/schemastery'
 import { ChromeRuntime, type ChromeRuntimeConfig } from './service.ts'
 import { DEFAULT_PAGE_SNAPSHOT_MAX_NODES } from './page-walker.ts'
 import { DEFAULT_OBSERVATORY_MAX_ENTRIES } from './observatory.ts'
+import { urlMatchesGlob } from './url-glob.ts'
 import type { ScreenshotAnalysisRoute } from './analysis.ts'
 import { applyChromeNavigateTool } from './tools/navigate.ts'
 import { applyChromeEvaluateTool } from './tools/evaluate.ts'
@@ -52,6 +53,7 @@ export type {
   PageTreeSnapshotResult,
 } from './types.ts'
 export { ChromeRuntime, parseJsonString } from './service.ts'
+export { urlMatchesGlob }
 export type { ChromeRuntimeConfig, ChromeConnectMode, ChromeConnectionInfo } from './service.ts'
 export {
   DEFAULT_PAGE_SNAPSHOT_MAX_NODES,

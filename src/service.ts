@@ -20,6 +20,7 @@ import fs from 'node:fs/promises'
 import { dirname } from 'node:path'
 import { CdpClient, createCdpClient } from './cdp.ts'
 import { networkConditions } from './emulation.ts'
+import { urlMatchesGlob } from './url-glob.ts'
 import { formatAxTree, storageReadExpression, storageWriteExpression, type RawAxNode } from './a11y.ts'
 import { disposeChild, fetchVersionInfo, launchChrome, normalizeDebugEndpoint, probeExistingEndpoint, type ChromeVersionInfo, type LaunchedChrome } from './launcher.ts'
 import { markdownExpression, type RawMarkdownSnapshot } from './markdown.ts'
@@ -380,14 +381,23 @@ export class ChromeRuntime extends Service {
    * applied once per connection when `downloadDir` is set) and record the
    * download lifecycle into the observatory.
    */
+  /** Per-client guard so browser-level download listeners are wired once per browser connection. */
+  private readonly downloadWiredClients = new WeakSet<object>()
+
   private setupDownloads(client: CdpClient, observatory: Observatory): void {
     if (this.config.downloadDir !== undefined && this.config.downloadDir.length > 0) {
       void client.send('Browser.setDownloadBehavior', {
         behavior: 'allow',
         downloadPath: this.config.downloadDir,
         eventsEnabled: true,
-      }).catch(() => undefined)
+      }).catch((error: unknown) => {
+        // Surface a misconfigured downloadDir instead of silently falling back to browser defaults.
+        observatory.recordBrowserLog({ level: 'error', text: `Browser.setDownloadBehavior failed: ${error instanceof Error ? error.message : String(error)}`, timestamp: Date.now() })
+      })
     }
+    // Browser-level events: wire once per client, not per tab switch.
+    if (this.downloadWiredClients.has(client)) return
+    this.downloadWiredClients.add(client)
     const filenames = new Map<string, string>()
     client.on('Browser.downloadWillBegin', (raw: unknown) => {
       const params = raw as { guid?: string; suggestedFilename?: string; url?: string }
@@ -406,6 +416,7 @@ export class ChromeRuntime extends Service {
       const params = raw as { guid?: string; state?: string; receivedBytes?: number; totalBytes?: number }
       if (params.guid === undefined || params.state === undefined || params.state === 'inProgress') return
       const filename = filenames.get(params.guid) ?? 'download'
+      filenames.delete(params.guid)
       observatory.recordDownload({
         state: params.state === 'completed' ? 'completed' : 'canceled',
         filename,
@@ -1112,12 +1123,15 @@ export class ChromeRuntime extends Service {
 
   /** Clear all network mocks (and stop interception on the current session). */
   async netMockClear(signal?: AbortSignal): Promise<{ cleared: number }> {
-    const active = await this.ensure(signal)
     const cleared = this.netMocks.size
     this.netMocks.clear()
-    // Stop events on the current session; the per-client handler stays wired
-    // (it only acts on live mocks), so a later netMock() re-enables cleanly.
-    await active.client.send('Fetch.disable', undefined, { sessionId: active.sessionId, signal }).catch(() => undefined)
+    // Stop events on the live session when there is one (a clear with no
+    // connection is still a valid local-table reset); the per-client handler
+    // stays wired (it only acts on live mocks), so a later netMock() re-enables cleanly.
+    if (this.state.kind === 'connected' && !this.state.active.client.isClosed) {
+      const { client, sessionId } = this.state.active
+      await client.send('Fetch.disable', undefined, { sessionId, signal }).catch(() => undefined)
+    }
     return { cleared }
   }
 
@@ -1315,7 +1329,7 @@ export class ChromeRuntime extends Service {
       await client.send('Browser.resetPermissions', undefined, { signal })
       applied.push('Browser.resetPermissions')
     }
-    if (options.resetPermissions === true) {
+    if (options.resetPermissions === true && options.clear !== true) {
       await client.send('Browser.resetPermissions', undefined, { signal })
       applied.push('Browser.resetPermissions')
     }
@@ -1564,15 +1578,6 @@ function raceWithTimeout<T>(promise: Promise<T>, timeoutMs: number, signal?: Abo
       },
     )
   })
-}
-
-/**
- * Test a URL against a CDP `Fetch`-style glob pattern (`*` matches any
- * character run, `?` a single character; other characters literal). Pure.
- */
-export function urlMatchesGlob(url: string, pattern: string): boolean {
-  const regex = new RegExp('^' + pattern.replace(/[.+^${}()|[\]\\]/g, '\\$&').replace(/\*/g, '.*').replace(/\?/g, '.') + '$')
-  return regex.test(url)
 }
 
 /** Best-effort JSON.parse of a string; returns undefined on any failure. */
