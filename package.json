@@ -1,6 +1,6 @@
 {
   "name": "@gemone/dsh-chrome",
-  "version": "0.5.2",
+  "version": "0.5.3",
   "description": "DeepSeek Harness plugin: model-facing tools that drive a real Chrome browser over the Chrome DevTools Protocol (CDP).",
   "type": "module",
   "main": "lib/index.js",
@@ -39,6 +39,14 @@
     "agent-tool"
   ],
   "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/gemone/dsh-chrome.git"
+  },
+  "homepage": "https://github.com/gemone/dsh-chrome#readme",
+  "bugs": {
+    "url": "https://github.com/gemone/dsh-chrome/issues"
+  },
   "publishConfig": {
     "access": "public",
     "provenance": true
