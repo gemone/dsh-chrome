@@ -79,6 +79,8 @@ export interface ChromeRuntimeConfig {
   readonly dialogPolicy?: 'accept' | 'dismiss'
   /** Prompt text sent when answering a `prompt` dialog under "accept". */
   readonly dialogPromptText?: string
+  /** Directory downloads are redirected into (absolute path). Unset = browser default handling. */
+  readonly downloadDir?: string
 }
 
 declare module '@deepseek-ai/cordis' {
@@ -357,7 +359,50 @@ export class ChromeRuntime extends Service {
     this.trackNetwork(client, sessionId, network, observatory)
     this.trackConsole(client, sessionId, observatory)
     this.trackDialogs(client, sessionId, observatory)
+    this.setupDownloads(client, observatory)
     return { client, targetId, sessionId, endpoint: info.endpoint, browser: info.browser ?? '', launched: info.launched, network, observatory, readCursors, pageRefs }
+  }
+
+  /**
+   * Redirect downloads into the configured directory (browser-level setting,
+   * applied once per connection when `downloadDir` is set) and record the
+   * download lifecycle into the observatory.
+   */
+  private setupDownloads(client: CdpClient, observatory: Observatory): void {
+    if (this.config.downloadDir !== undefined && this.config.downloadDir.length > 0) {
+      void client.send('Browser.setDownloadBehavior', {
+        behavior: 'allow',
+        downloadPath: this.config.downloadDir,
+        eventsEnabled: true,
+      }).catch(() => undefined)
+    }
+    const filenames = new Map<string, string>()
+    client.on('Browser.downloadWillBegin', (raw: unknown) => {
+      const params = raw as { guid?: string; suggestedFilename?: string; url?: string }
+      if (params.guid === undefined) return
+      const filename = params.suggestedFilename ?? 'download'
+      filenames.set(params.guid, filename)
+      observatory.recordDownload({
+        state: 'started',
+        filename,
+        ...params.url !== undefined ? { url: params.url } : {},
+        ...this.config.downloadDir !== undefined ? { path: `${this.config.downloadDir}/${filename}` } : {},
+        timestamp: Date.now(),
+      })
+    })
+    client.on('Browser.downloadProgress', (raw: unknown) => {
+      const params = raw as { guid?: string; state?: string; receivedBytes?: number; totalBytes?: number }
+      if (params.guid === undefined || params.state === undefined || params.state === 'inProgress') return
+      const filename = filenames.get(params.guid) ?? 'download'
+      observatory.recordDownload({
+        state: params.state === 'completed' ? 'completed' : 'canceled',
+        filename,
+        ...this.config.downloadDir !== undefined ? { path: `${this.config.downloadDir}/${filename}` } : {},
+        ...params.receivedBytes !== undefined ? { receivedBytes: params.receivedBytes } : {},
+        ...params.totalBytes !== undefined ? { totalBytes: params.totalBytes } : {},
+        timestamp: Date.now(),
+      })
+    })
   }
 
   /**

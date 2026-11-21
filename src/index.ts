@@ -182,6 +182,8 @@ export interface Config {
   dialogPolicy?: 'accept' | 'dismiss'
   /** Prompt text sent when answering a `prompt` dialog under "accept". */
   dialogPromptText?: string
+  /** Directory downloads are redirected into (absolute path). Unset = browser default handling. */
+  downloadDir?: string
   /** Cap on `chrome_snapshot` output characters. Defaults to 200000. */
   snapshotMaxChars?: number
   /** Cap on `chrome_page_snapshot` tree nodes. Defaults to 500. */
@@ -215,6 +217,7 @@ export const Config: z<Config> = z.object({
   reuseExisting: z.boolean().default(true),
   dialogPolicy: z.union([z.const('accept'), z.const('dismiss')]).default('accept'),
   dialogPromptText: z.string(),
+  downloadDir: z.string(),
   port: z.number().default(DEFAULT_CHROME_PORT),
   host: z.string().default('127.0.0.1'),
   headless: z.union([z.boolean(), z.const('new')]).default('new'),
@@ -258,6 +261,7 @@ type ResolvedConfig = {
   reuseExisting: boolean
   dialogPolicy: 'accept' | 'dismiss'
   dialogPromptText: string | undefined
+  downloadDir: string | undefined
   port: number
   host: string
   headless: boolean | 'new'
@@ -279,6 +283,7 @@ function runtimeConfig(config: ResolvedConfig): ChromeRuntimeConfig {
     reuseExisting: config.reuseExisting,
     ...config.dialogPolicy !== undefined ? { dialogPolicy: config.dialogPolicy } : {},
     ...config.dialogPromptText !== undefined && config.dialogPromptText.length > 0 ? { dialogPromptText: config.dialogPromptText } : {},
+    ...config.downloadDir !== undefined && config.downloadDir.length > 0 ? { downloadDir: config.downloadDir } : {},
     port: config.port,
     host: config.host,
     headless: config.headless,

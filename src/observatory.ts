@@ -63,7 +63,7 @@ export interface ConsoleEntry {
   /** Monotonic sequence number, stable across the whole connection. */
   index: number
   /** Where it came from. */
-  source: 'console' | 'exception' | 'browser-log' | 'dialog'
+  source: 'console' | 'exception' | 'browser-log' | 'dialog' | 'download'
   /** Severity; exceptions and failed browser logs map to `error`. */
   level: ConsoleLevel
   /** One-line human-readable text (bounded). */
@@ -269,6 +269,32 @@ export class Observatory {
       timestamp: params.timestamp,
       ...params.url !== undefined ? { url: params.url } : {},
       ...params.lineNumber !== undefined ? { lineNumber: params.lineNumber } : {},
+    })
+  }
+
+  /**
+   * Record one download lifecycle event (started/completed/canceled) when a
+   * download directory is configured.
+   */
+  recordDownload(params: {
+    state: 'started' | 'completed' | 'canceled'
+    filename: string
+    url?: string
+    path?: string
+    receivedBytes?: number
+    totalBytes?: number
+    timestamp: number
+  }): void {
+    const size = params.totalBytes !== undefined
+      ? ` (${params.receivedBytes ?? 0}/${params.totalBytes} bytes)`
+      : params.receivedBytes !== undefined ? ` (${params.receivedBytes} bytes)` : ''
+    this.pushConsole({
+      index: this.consoleCursor++,
+      source: 'download',
+      level: 'log',
+      text: `download ${params.state}: ${params.filename}${params.path !== undefined ? ` → ${params.path}` : ''}${size}`,
+      timestamp: params.timestamp,
+      ...params.url !== undefined && params.url.length > 0 ? { url: params.url } : {},
     })
   }
 
