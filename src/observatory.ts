@@ -331,7 +331,10 @@ export class Observatory {
   /** Count unread activity relative to the model's read cursors. Pure. */
   unread(netReadIndex: number, consoleReadIndex: number): UnreadActivity {
     return {
-      consoleEntries: this.consoleEntries.filter(entry => entry.index >= consoleReadIndex && entry.level === 'error').length,
+      consoleEntries: this.consoleEntries.filter(entry =>
+        entry.index >= consoleReadIndex
+        && (entry.level === 'error' || entry.source === 'dialog'),
+      ).length,
       failedRequests: this.netEntries.filter(entry => entry.failed === true && entry.seq >= netReadIndex).length,
     }
   }
@@ -471,7 +474,7 @@ export function formatConsoleRead(result: ConsoleReadResult): string {
 export function formatActivityHint(activity: UnreadActivity): string {
   const parts: string[] = []
   if (activity.consoleEntries > 0) {
-    parts.push(`${activity.consoleEntries} unread console error(s) — use chrome_console_read`)
+    parts.push(`${activity.consoleEntries} unread console/dialog entry(ies) — use chrome_console_read`)
   }
   if (activity.failedRequests > 0) {
     parts.push(`${activity.failedRequests} failed request(s) — use chrome_net_list({ failedOnly: true })`)

@@ -99,6 +99,8 @@ All options live under the `chrome-tool:` section. Every field is optional with 
 | `launch` | `true` | Launch a managed Chrome. `false` = attach to `cdpUrl` only. |
 | `cdpUrl` | — | Existing CDP endpoint when `launch: false` (`ws://…` or `http(s)://…`). Required when `launch` is false. |
 | `reuseExisting` | `true` | Before launching on `port`, probe the debugger endpoint and **reuse the instance already listening** instead of spawning a second Chrome over the same port. `false` = always launch fresh (the port must be free). The agent can override per call via `chrome_connect`. |
+| `dialogPolicy` | `"accept"` | How JS dialogs (`alert`/`confirm`/`prompt`/`beforeunload`) are answered: `"accept"` or `"dismiss"`. Auto-answering keeps the target responsive — an unanswered dialog blocks every tool. Each dialog (and its answer) is recorded into the observatory and surfaced via the `[page activity: …]` hint. |
+| `dialogPromptText` | — | Prompt text sent when accepting a `prompt` dialog. |
 | `port` | `9222` | Remote debugging port. |
 | `host` | `127.0.0.1` | Chrome debug endpoint host. |
 | `headless` | `"new"` | `true` (old headless), `"new"`, or `false` (visible window). |

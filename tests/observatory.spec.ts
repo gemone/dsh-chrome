@@ -98,6 +98,18 @@ describe('Observatory console recording', () => {
     expect(read.entries[0]?.text).toContain('TypeError')
   })
 
+  it('records dialogs with their answer policy', () => {
+    const obs = new Observatory()
+    obs.recordDialog({ kind: 'confirm', message: 'Leave site?', url: 'https://x.com/', response: 'accepted', timestamp: 1 })
+    obs.recordDialog({ kind: 'prompt', message: 'Enter name', response: 'dismissed', timestamp: 2 })
+    const read = obs.consoleSince({ minLevel: 'warning' }, 0)
+    expect(read.entries).toHaveLength(2)
+    expect(read.entries[0]).toMatchObject({ source: 'dialog', level: 'warning', url: 'https://x.com/' })
+    expect(read.entries[0]?.text).toContain('confirm dialog accepted')
+    expect(read.entries[1]?.text).toContain('prompt dialog dismissed')
+    expect(formatConsoleRead(read)).toContain('(dialog)')
+  })
+
   it('only returns unread entries after the cursor advances', () => {
     const obs = new Observatory()
     obs.recordConsole({ type: 'error', args: [{ type: 'string', value: 'e1' }], timestamp: 1 })
@@ -203,7 +215,7 @@ describe('formatting', () => {
   it('renders the activity hint only when there is unread activity', () => {
     expect(formatActivityHint({ consoleEntries: 0, failedRequests: 0 })).toBe('')
     const hint = formatActivityHint({ consoleEntries: 2, failedRequests: 1 })
-    expect(hint).toContain('2 unread console error(s)')
+    expect(hint).toContain('2 unread console/dialog entry(ies)')
     expect(hint).toContain('1 failed request(s)')
     expect(hint).toContain('chrome_console_read')
     expect(hint).toContain('chrome_net_list')
