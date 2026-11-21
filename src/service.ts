@@ -1129,11 +1129,17 @@ export class ChromeRuntime extends Service {
         return
       }
       const mock = matched[1]
+      // Always include a permissive CORS header: mocked responses are for
+      // the model's testing, and a cross-origin page fetch must not fail in
+      // the CORS layer after the interception already succeeded.
       await active.client.send('Fetch.fulfillRequest', {
         requestId: params.requestId,
         responseCode: mock.status,
         body: Buffer.from(mock.body, 'utf-8').toString('base64'),
-        responseHeaders: [{ name: 'Content-Type', value: mock.contentType }],
+        responseHeaders: [
+          { name: 'Content-Type', value: mock.contentType },
+          { name: 'Access-Control-Allow-Origin', value: '*' },
+        ],
       }, { sessionId: active.sessionId }).catch(() => undefined)
     })
     this.fetchIntercepted = true
