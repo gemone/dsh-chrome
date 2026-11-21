@@ -4,4 +4,4 @@
 # the profile directory). See README.md for install/enable instructions.
 - insert:
     - id: chrome-tool
-      name: dsh-chrome
+      name: "@gemone/dsh-chrome"

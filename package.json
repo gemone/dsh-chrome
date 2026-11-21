@@ -1,14 +1,14 @@
 {
-  "name": "dsh-chrome",
-  "version": "0.5.0",
+  "name": "@gemone/dsh-chrome",
+  "version": "0.5.1",
   "description": "DeepSeek Harness plugin: model-facing tools that drive a real Chrome browser over the Chrome DevTools Protocol (CDP).",
   "type": "module",
   "main": "lib/index.js",
   "types": "lib/index.d.ts",
   "exports": {
     ".": {
- "types": "./lib/index.d.ts",
- "default": "./lib/index.js"
+      "types": "./lib/index.d.ts",
+      "default": "./lib/index.js"
     },
     "./package.json": "./package.json"
   },
@@ -39,6 +39,10 @@
     "agent-tool"
   ],
   "license": "MIT",
+  "publishConfig": {
+    "access": "public",
+    "provenance": true
+  },
   "engines": {
     "node": ">=20"
   },

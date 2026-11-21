@@ -78,11 +78,14 @@ Local `add` uses `link:` and does **not** run `prepare`, so you must `pnpm build
 ### From npm or a tarball
 
 ```sh
-dsh plugin --profile web add dsh-chrome
-dsh plugin --profile web add ./dsh-chrome-0.4.0.tgz
+dsh plugin --profile web add @gemone/dsh-chrome
+dsh plugin --profile web add @gemone/dsh-chrome@0.5.1
+dsh plugin --profile web add ./gemone-dsh-chrome-0.5.1.tgz
 ```
 
-No build permission needed — `lib/` is pre-built.
+No build permission needed — `lib/` is pre-built. Releases are published
+automatically by `.github/workflows/publish.yml` when a `v*` tag is pushed
+(npm Trusted Publishing or an `NPM_TOKEN` secret; provenance attached).
 
 ### Verify and boot
 
@@ -91,7 +94,7 @@ dsh --profile web --dump-config   # a "# == dsh-chrome" layer with the chrome-to
 dsh --profile web
 ```
 
-Remove with `dsh plugin --profile web remove dsh-chrome`.
+Remove with `dsh plugin --profile web remove @gemone/dsh-chrome`.
 
 ## Configuration
 

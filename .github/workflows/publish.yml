@@ -1,0 +1,77 @@
+name: Publish to npm
+
+# Publishes the package to the npm registry when a release tag is pushed.
+#
+# Auth model (pick one on npmjs.com → package → Settings):
+#   1. Trusted Publishing (recommended, no token): configure the package's
+#      "Trusted publisher" as GitHub repo <owner>/<repo>, workflow
+#      "publish.yml", environment "release". Then no NPM_TOKEN secret is
+#      needed and `--provenance` attaches an OIDC-signed build attestation.
+#   2. Automation token (fallback): create an "Automation" token on npm and
+#      add it as the NPM_TOKEN repository secret. Provenance still works
+#      because the job grants `id-token: write`.
+#
+# Tags must match the package version: `v0.5.0` publishes `0.5.0`.
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write # for npm provenance / Trusted Publishing
+
+concurrency:
+  group: publish-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    environment: release
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 11
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+          registry-url: https://registry.npmjs.org/
+
+      # pnpm-lock.yaml is intentionally not committed; resolve fresh.
+      - name: Install dependencies
+        run: pnpm install --no-frozen-lockfile
+
+      - name: Typecheck
+        run: pnpm typecheck
+
+      - name: Unit tests
+        run: pnpm test
+
+      - name: Build
+        run: pnpm build
+
+      # Fail fast when the tag and package.json version disagree.
+      - name: Verify tag matches package version
+        if: github.ref_type == 'tag'
+        run: |
+          PKG_VERSION="v$(node -p "require('./package.json').version")"
+          if [ "$GITHUB_REF_NAME" != "$PKG_VERSION" ]; then
+            echo "::error::tag $GITHUB_REF_NAME does not match package version $PKG_VERSION"
+            exit 1
+          fi
+
+      - name: Dry-run pack
+        run: npm pack --dry-run --ignore-scripts
+
+      - name: Publish
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+          NPM_CONFIG_PROVENANCE: true
+        run: npm publish --access public --provenance
