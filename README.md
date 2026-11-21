@@ -29,6 +29,7 @@ A [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) plugin tha
 | `chrome_storage` | Inspect or change page state: cookies (`kind: "cookies"`, scoped to the current page URL) and localStorage/sessionStorage (`kind: "local"/"session"`, current origin). Operations: get/set/remove/clear. Values are sensitive. | `Network.getCookies` etc. / `Runtime.evaluate` |
 | `chrome_upload` | Set local file paths on a file input (`<input type="file">`) by CSS selector or `[ref=eN]` — the one form interaction `chrome_type` cannot do. Every path must exist and be readable. | `DOM.setFileInputFiles` |
 | `chrome_tab` | Manage the browser's tabs: `list` (attached marks the driven tab), `new` (open + switch), `switch` (by index or targetId). The previous tab stays alive; observatory counters are per-tab and reset on switch. | `Target.getTargets` / `createTarget` / `attachToTarget` |
+| `chrome_mhtml` | Archive the whole page (layout + inline resources) as a single MHTML file at an absolute path. Complete offline copy; use `chrome_pdf` for documents, `chrome_screenshot` for images. | `Page.captureSnapshot` |
 
 `chrome_page_snapshot` accepts `format: "a11y"` to read the page's
 accessibility tree instead of the DOM tree (semantic roles, names, and

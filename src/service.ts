@@ -1276,6 +1276,24 @@ export class ChromeRuntime extends Service {
   }
 
   /**
+   * Capture the whole page as a single MHTML file (layout + inline resources)
+   * via `Page.captureSnapshot` and write it to `path`.
+   */
+  async mhtml(options: { path: string; signal?: AbortSignal }): Promise<{ path: string; bytes: number }> {
+    const active = await this.ensure(options.signal)
+    const response = await active.client.send('Page.captureSnapshot', { format: 'mhtml' }, {
+      sessionId: active.sessionId, signal: options.signal,
+    }) as { data?: string }
+    if (typeof response.data !== 'string' || response.data.length === 0) {
+      throw new ChromeError('Page.captureSnapshot returned no data', 'CHROME_CDP_ERROR')
+    }
+    const bytes = Buffer.from(response.data, 'utf-8')
+    await fs.mkdir(dirname(options.path), { recursive: true })
+    await fs.writeFile(options.path, bytes)
+    return { path: options.path, bytes: bytes.length }
+  }
+
+  /**
    * Print the page to PDF via `Page.printToPDF` and write it to `path`
    * (created recursively when missing). Returns the file size in bytes.
    */
