@@ -883,6 +883,61 @@ export class ChromeRuntime extends Service {
   }
 
   /**
+   * Point a file input at local files via `DOM.setFileInputFiles` — the one
+   * form interaction `Input.insertText` cannot perform. Every path must exist
+   * and be readable; the element must be an `<input type="file">`.
+   */
+  async upload(options: {
+    selector: string
+    paths: readonly string[]
+    signal?: AbortSignal
+  }): Promise<{ uploaded: boolean; selector: string; fileCount?: number; coveredBy?: string }> {
+    if (options.paths.length === 0) {
+      throw new ChromeError('upload requires at least one file path', 'CHROME_CDP_ERROR')
+    }
+    // Fail fast with a readable message when a path does not exist.
+    await Promise.all(options.paths.map(async path => {
+      try { await fs.access(path, fs.constants.R_OK) } catch {
+        throw new ChromeError(`upload file not found or not readable: ${path}`, 'CHROME_CDP_ERROR')
+      }
+    }))
+    const active = await this.ensure(options.signal)
+    const { client, sessionId } = active
+    // Confirm the selector resolves to a file input before touching the DOM.
+    const probe = await this.evaluate(`(() => { const el = document.querySelector(${JSON.stringify(options.selector)}); if (!el) return JSON.stringify({ found: false }); const r = el.getBoundingClientRect(); const x = r.x + r.width / 2, y = r.y + r.height / 2; let coveredBy = null; const top = document.elementFromPoint(x, y); if (top && top !== el && !el.contains(top) && !top.contains(el)) coveredBy = top.tagName.toLowerCase(); return JSON.stringify({ found: true, type: el instanceof HTMLInputElement ? el.type : String(el.tagName).toLowerCase(), coveredBy }); })()`, { signal: options.signal })
+    const info = parseJsonString(probe.result) as { found: boolean; type?: string; coveredBy?: string | null } | undefined
+    if (info === undefined || info.found !== true) {
+      return { uploaded: false, selector: options.selector }
+    }
+    if (info.type !== 'file') {
+      throw new ChromeError(`element at ${options.selector} is a <${info.type ?? 'unknown'}> input, not a file input`, 'CHROME_CDP_ERROR')
+    }
+    const document_ = await client.send('DOM.getDocument', { depth: 0 }, {
+      sessionId, signal: options.signal,
+    }) as { root?: { nodeId?: number } }
+    const rootNodeId = document_.root?.nodeId
+    if (rootNodeId === undefined) {
+      throw new ChromeError('DOM.getDocument returned no root node', 'CHROME_CDP_ERROR')
+    }
+    const queried = await client.send('DOM.querySelector', { nodeId: rootNodeId, selector: options.selector }, {
+      sessionId, signal: options.signal,
+    }) as { nodeId?: number }
+    if (queried.nodeId === undefined) {
+      return { uploaded: false, selector: options.selector }
+    }
+    await client.send('DOM.setFileInputFiles', {
+      files: [...options.paths],
+      nodeId: queried.nodeId,
+    }, { sessionId, signal: options.signal })
+    return {
+      uploaded: true,
+      selector: options.selector,
+      fileCount: options.paths.length,
+      ...info.coveredBy !== undefined && info.coveredBy !== null ? { coveredBy: info.coveredBy } : {},
+    }
+  }
+
+  /**
    * One storage operation: browser cookies (via the Network domain, scoped to
    * the current page's URL unless `url` is given) or the current origin's
    * localStorage / sessionStorage (via the page).

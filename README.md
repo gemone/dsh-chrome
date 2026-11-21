@@ -27,6 +27,7 @@ A [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) plugin tha
 | `chrome_emulate` | Override the page environment: viewport/DPR/mobile, network throttling (`offline`/`slow3G`/`fast3G`/`none`), CPU throttling, geolocation, timezone, locale, user-agent. `clear: true` resets first. | `Emulation`/`Network` |
 | `chrome_pdf` | Print the page to a PDF file at an absolute path (landscape, printBackground, paperFormat, scale, pageRanges). | `Page.printToPDF` |
 | `chrome_storage` | Inspect or change page state: cookies (`kind: "cookies"`, scoped to the current page URL) and localStorage/sessionStorage (`kind: "local"/"session"`, current origin). Operations: get/set/remove/clear. Values are sensitive. | `Network.getCookies` etc. / `Runtime.evaluate` |
+| `chrome_upload` | Set local file paths on a file input (`<input type="file">`) by CSS selector or `[ref=eN]` — the one form interaction `chrome_type` cannot do. Every path must exist and be readable. | `DOM.setFileInputFiles` |
 
 `chrome_page_snapshot` accepts `format: "a11y"` to read the page's
 accessibility tree instead of the DOM tree (semantic roles, names, and

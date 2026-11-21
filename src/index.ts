@@ -38,6 +38,7 @@ import { applyChromeConsoleTool } from './tools/console.ts'
 import { applyChromeEmulateTool } from './tools/emulate.ts'
 import { applyChromePdfTool } from './tools/pdf.ts'
 import { applyChromeStorageTool } from './tools/storage.ts'
+import { applyChromeUploadTool } from './tools/upload.ts'
 
 export { ChromeError, computeCaptureScale } from './types.ts'
 export type {
@@ -79,6 +80,7 @@ export {
   applyChromeEmulateTool,
   applyChromePdfTool,
   applyChromeStorageTool,
+  applyChromeUploadTool,
 } from './tools/index.ts'
 
 /** Default remote debugging port for a launched Chrome. */
@@ -145,6 +147,8 @@ export interface Config {
   pdf?: boolean
   /** Register `chrome_storage` (cookies + web storage). Defaults to true. */
   storage?: boolean
+  /** Register `chrome_upload` (file inputs). Defaults to true. */
+  upload?: boolean
   /** Ring-buffer capacity per observatory stream (network / console). Defaults to 500. */
   observatoryMaxEntries?: number
   /** Explicit Chrome executable path; omitted = discover. */
@@ -203,6 +207,7 @@ export const Config: z<Config> = z.object({
   emulate: z.boolean().default(true),
   pdf: z.boolean().default(true),
   storage: z.boolean().default(true),
+  upload: z.boolean().default(true),
   observatoryMaxEntries: z.number().default(DEFAULT_OBSERVATORY_MAX_ENTRIES),
   executablePath: z.string(),
   launch: z.boolean().default(true),
@@ -245,6 +250,7 @@ type ResolvedConfig = {
   emulate: boolean
   pdf: boolean
   storage: boolean
+  upload: boolean
   observatoryMaxEntries: number
   executablePath: string | undefined
   launch: boolean
@@ -348,4 +354,5 @@ export function apply(ctx: Context, config: Config): void {
   if (resolved.emulate) applyChromeEmulateTool(ctx, chrome, resolved.operationTimeoutMs)
   if (resolved.pdf) applyChromePdfTool(ctx, chrome, resolved.operationTimeoutMs)
   if (resolved.storage) applyChromeStorageTool(ctx, chrome, resolved.operationTimeoutMs)
+  if (resolved.upload) applyChromeUploadTool(ctx, chrome, resolved.operationTimeoutMs)
 }
