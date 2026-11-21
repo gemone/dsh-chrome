@@ -784,7 +784,11 @@ export class ChromeRuntime extends Service {
       return { clicked: false, selector }
     }
     const cdpButton = button === 'left' ? 'left' : button === 'right' ? 'right' : 'middle'
-    await active.client.send('Input.dispatchMouseEvent', { type: 'mouseMoved', x: center.x, y: center.y }, { sessionId: active.sessionId, signal })
+    // Chrome (≥154 observed) does not synthesize the `click` event unless the
+    // press/release pair uses minimal parameters: any preceding mouseMoved, or
+    // extra fields like pointerType/buttons, downgrades the sequence to
+    // mousedown/mouseup only and inline onclick never fires. Keep the raw
+    // minimal pair — verified against Chrome 154 event logs.
     await active.client.send('Input.dispatchMouseEvent', { type: 'mousePressed', x: center.x, y: center.y, button: cdpButton, clickCount: 1 }, { sessionId: active.sessionId, signal })
     await active.client.send('Input.dispatchMouseEvent', { type: 'mouseReleased', x: center.x, y: center.y, button: cdpButton, clickCount: 1 }, { sessionId: active.sessionId, signal })
     return {
