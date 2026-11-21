@@ -5,7 +5,7 @@ import ToolRuntime from '@deepseek-ai/dsh-tools'
 import { apply, Config, name, inject } from '../src/index.ts'
 import { ChromeRuntime } from '../src/service.ts'
 
-const EXPECTED_TOOLS = ['chrome_navigate', 'chrome_evaluate', 'chrome_snapshot', 'chrome_page_snapshot', 'chrome_click', 'chrome_screenshot', 'chrome_scroll', 'chrome_type', 'chrome_press_key', 'chrome_close', 'chrome_connect', 'chrome_net_list', 'chrome_net_body', 'chrome_console_read', 'chrome_emulate', 'chrome_pdf', 'chrome_storage', 'chrome_upload', 'chrome_tab', 'chrome_mhtml']
+const EXPECTED_TOOLS = ['chrome_navigate', 'chrome_evaluate', 'chrome_snapshot', 'chrome_page_snapshot', 'chrome_click', 'chrome_screenshot', 'chrome_scroll', 'chrome_type', 'chrome_press_key', 'chrome_close', 'chrome_connect', 'chrome_net_list', 'chrome_net_body', 'chrome_console_read', 'chrome_emulate', 'chrome_pdf', 'chrome_storage', 'chrome_upload', 'chrome_tab', 'chrome_mhtml', 'chrome_net_mock']
 
 async function setup() {
   const ctx = new Context()

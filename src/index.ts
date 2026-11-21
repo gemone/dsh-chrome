@@ -41,6 +41,7 @@ import { applyChromeStorageTool } from './tools/storage.ts'
 import { applyChromeUploadTool } from './tools/upload.ts'
 import { applyChromeTabTool } from './tools/tab.ts'
 import { applyChromeMhtmlTool } from './tools/mhtml.ts'
+import { applyChromeNetMockTool } from './tools/net-mock.ts'
 
 export { ChromeError, computeCaptureScale } from './types.ts'
 export type {
@@ -85,6 +86,7 @@ export {
   applyChromeUploadTool,
   applyChromeTabTool,
   applyChromeMhtmlTool,
+  applyChromeNetMockTool,
 } from './tools/index.ts'
 
 /** Default remote debugging port for a launched Chrome. */
@@ -157,6 +159,8 @@ export interface Config {
   tab?: boolean
   /** Register `chrome_mhtml` (single-file page archive). Defaults to true. */
   mhtml?: boolean
+  /** Register `chrome_net_mock` (Fetch interception mocks). Defaults to true. */
+  netMock?: boolean
   /** Ring-buffer capacity per observatory stream (network / console). Defaults to 500. */
   observatoryMaxEntries?: number
   /** Explicit Chrome executable path; omitted = discover. */
@@ -220,6 +224,7 @@ export const Config: z<Config> = z.object({
   upload: z.boolean().default(true),
   tab: z.boolean().default(true),
   mhtml: z.boolean().default(true),
+  netMock: z.boolean().default(true),
   observatoryMaxEntries: z.number().default(DEFAULT_OBSERVATORY_MAX_ENTRIES),
   executablePath: z.string(),
   launch: z.boolean().default(true),
@@ -266,6 +271,7 @@ type ResolvedConfig = {
   upload: boolean
   tab: boolean
   mhtml: boolean
+  netMock: boolean
   observatoryMaxEntries: number
   executablePath: string | undefined
   launch: boolean
@@ -374,4 +380,5 @@ export function apply(ctx: Context, config: Config): void {
   if (resolved.upload) applyChromeUploadTool(ctx, chrome, resolved.operationTimeoutMs)
   if (resolved.tab) applyChromeTabTool(ctx, chrome, resolved.operationTimeoutMs)
   if (resolved.mhtml) applyChromeMhtmlTool(ctx, chrome, resolved.operationTimeoutMs)
+  if (resolved.netMock) applyChromeNetMockTool(ctx, chrome, resolved.operationTimeoutMs)
 }

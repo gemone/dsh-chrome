@@ -1069,6 +1069,75 @@ export class ChromeRuntime extends Service {
     const parsed = parseJsonString(meta.result) as { url?: string; title?: string } | undefined
     return { url: parsed?.url ?? '', title: parsed?.title ?? '' }
   }
+  /** Active network mocks for the current connection: URL pattern → canned response. */
+  private netMocks = new Map<string, { status: number; body: string; contentType: string }>()
+
+  /**
+   * Set one network mock: requests whose URL matches the glob `pattern`
+   * (`*` wildcards, CDP `Fetch` interception syntax) are answered with the
+   * canned response without touching the network. Overwrites any mock with
+   * the same pattern. Requires Fetch interception, enabled lazily and once
+   * per connection.
+   */
+  async netMock(options: {
+    pattern: string
+    status?: number
+    body?: string
+    contentType?: string
+    signal?: AbortSignal
+  }): Promise<{ pattern: string; status: number; mocks: number }> {
+    if (options.pattern.trim().length === 0) {
+      throw new ChromeError('netMock requires a non-empty URL pattern', 'CHROME_CDP_ERROR')
+    }
+    const active = await this.ensure(options.signal)
+    const entry = {
+      status: options.status ?? 200,
+      body: options.body ?? '',
+      contentType: options.contentType ?? 'text/plain',
+    }
+    this.netMocks.set(options.pattern, entry)
+    await this.ensureFetchInterception(active)
+    return { pattern: options.pattern, status: entry.status, mocks: this.netMocks.size }
+  }
+
+  /** Clear all network mocks (and stop interception). */
+  async netMockClear(signal?: AbortSignal): Promise<{ cleared: number }> {
+    const active = await this.ensure(signal)
+    const cleared = this.netMocks.size
+    this.netMocks.clear()
+    if (this.fetchIntercepted === true) {
+      await active.client.send('Fetch.disable', undefined, { sessionId: active.sessionId, signal }).catch(() => undefined)
+      this.fetchIntercepted = false
+    }
+    return { cleared }
+  }
+
+  /** Whether Fetch interception is currently enabled for the connection. */
+  private fetchIntercepted = false
+
+  /** Enable Fetch interception once per connection, wired to the mock table. */
+  private async ensureFetchInterception(active: ActiveConnection): Promise<void> {
+    if (this.fetchIntercepted === true) return
+    await active.client.send('Fetch.enable', { patterns: [{ urlPattern: '*' }] }, { sessionId: active.sessionId })
+    active.client.on('Fetch.requestPaused', async (raw: unknown) => {
+      const params = raw as { requestId?: string; request?: { url?: string } }
+      const url = params.request?.url ?? ''
+      const matched = [...this.netMocks.entries()].find(([pattern]) => urlMatchesGlob(url, pattern))
+      if (matched === undefined || params.requestId === undefined) {
+        // Not mocked: continue the request untouched.
+        void active.client.send('Fetch.continueRequest', { requestId: params.requestId }, { sessionId: active.sessionId }).catch(() => undefined)
+        return
+      }
+      const mock = matched[1]
+      await active.client.send('Fetch.fulfillRequest', {
+        requestId: params.requestId,
+        responseCode: mock.status,
+        body: Buffer.from(mock.body, 'utf-8').toString('base64'),
+        responseHeaders: [{ name: 'Content-Type', value: mock.contentType }],
+      }, { sessionId: active.sessionId }).catch(() => undefined)
+    })
+    this.fetchIntercepted = true
+  }
 
   /**
    * One storage operation: browser cookies (via the Network domain, scoped to
@@ -1471,6 +1540,15 @@ function raceWithTimeout<T>(promise: Promise<T>, timeoutMs: number, signal?: Abo
       },
     )
   })
+}
+
+/**
+ * Test a URL against a CDP `Fetch`-style glob pattern (`*` matches any
+ * character run, `?` a single character; other characters literal). Pure.
+ */
+export function urlMatchesGlob(url: string, pattern: string): boolean {
+  const regex = new RegExp('^' + pattern.replace(/[.+^${}()|[\]\\]/g, '\\$&').replace(/\*/g, '.*').replace(/\?/g, '.') + '$')
+  return regex.test(url)
 }
 
 /** Best-effort JSON.parse of a string; returns undefined on any failure. */
