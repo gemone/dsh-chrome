@@ -1,6 +1,6 @@
 {
   "name": "@gemone/dsh-chrome",
-  "version": "0.5.1",
+  "version": "0.5.2",
   "description": "DeepSeek Harness plugin: model-facing tools that drive a real Chrome browser over the Chrome DevTools Protocol (CDP).",
   "type": "module",
   "main": "lib/index.js",

@@ -41,8 +41,8 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: 22
-          cache: pnpm
           registry-url: https://registry.npmjs.org/
+          # No `cache: pnpm`: pnpm-lock.yaml is intentionally not committed.
 
       # pnpm-lock.yaml is intentionally not committed; resolve fresh.
       - name: Install dependencies
