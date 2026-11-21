@@ -1,6 +1,6 @@
 {
   "name": "dsh-chrome",
-  "version": "0.4.0",
+  "version": "0.5.0",
   "description": "DeepSeek Harness plugin: model-facing tools that drive a real Chrome browser over the Chrome DevTools Protocol (CDP).",
   "type": "module",
   "main": "lib/index.js",
