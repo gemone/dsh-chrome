@@ -366,6 +366,12 @@ export class ChromeRuntime extends Service {
     this.trackConsole(client, sessionId, observatory)
     this.trackDialogs(client, sessionId, observatory)
     this.setupDownloads(client, observatory)
+    // Fresh session: re-arm Fetch interception when mocks are active, so
+    // mocks keep working after reconnects and tab switches. Awaited: a
+    // fire-and-forget enable races the page's own first requests.
+    if (this.netMocks.size > 0) {
+      await this.enableMockInterception({ client, sessionId }).catch(() => undefined)
+    }
     return { client, targetId, sessionId, endpoint: info.endpoint, browser: info.browser ?? '', launched: info.launched, network, observatory, readCursors, pageRefs }
   }
 
@@ -1100,43 +1106,52 @@ export class ChromeRuntime extends Service {
       contentType: options.contentType ?? 'text/plain',
     }
     this.netMocks.set(options.pattern, entry)
-    await this.ensureFetchInterception(active)
+    await this.enableMockInterception(active)
     return { pattern: options.pattern, status: entry.status, mocks: this.netMocks.size }
   }
 
-  /** Clear all network mocks (and stop interception). */
+  /** Clear all network mocks (and stop interception on the current session). */
   async netMockClear(signal?: AbortSignal): Promise<{ cleared: number }> {
     const active = await this.ensure(signal)
     const cleared = this.netMocks.size
     this.netMocks.clear()
-    if (this.fetchIntercepted === true) {
-      await active.client.send('Fetch.disable', undefined, { sessionId: active.sessionId, signal }).catch(() => undefined)
-      this.fetchIntercepted = false
-    }
+    // Stop events on the current session; the per-client handler stays wired
+    // (it only acts on live mocks), so a later netMock() re-enables cleanly.
+    await active.client.send('Fetch.disable', undefined, { sessionId: active.sessionId, signal }).catch(() => undefined)
     return { cleared }
   }
 
-  /** Whether Fetch interception is currently enabled for the connection. */
-  private fetchIntercepted = false
+  /** Per-client guard so the requestPaused handler is wired exactly once per browser connection. */
+  private readonly mockWiredClients = new WeakSet<object>()
 
-  /** Enable Fetch interception once per connection, wired to the mock table. */
-  private async ensureFetchInterception(active: ActiveConnection): Promise<void> {
-    if (this.fetchIntercepted === true) return
-    await active.client.send('Fetch.enable', { patterns: [{ urlPattern: '*' }] }, { sessionId: active.sessionId })
-    active.client.on('Fetch.requestPaused', async (raw: unknown) => {
+  /**
+   * Enable Fetch interception for THIS session when mocks are active, and
+   * wire the requestPaused handler once per browser client. Per-session
+   * enabling (instead of a runtime-level flag) keeps mocks working after
+   * reconnects and tab switches, where a fresh session needs its own
+   * Fetch.enable; responses answer on the event's own session.
+   */
+  private async enableMockInterception(active: Pick<ActiveConnection, 'client' | 'sessionId'>): Promise<void> {
+    if (this.netMocks.size === 0) return
+    const { client, sessionId } = active
+    await client.send('Fetch.enable', { patterns: [{ urlPattern: '*' }] }, { sessionId })
+    if (this.mockWiredClients.has(client)) return
+    this.mockWiredClients.add(client)
+    client.on('Fetch.requestPaused', async (raw: unknown, eventSessionId?: string) => {
       const params = raw as { requestId?: string; request?: { url?: string } }
       const url = params.request?.url ?? ''
       const matched = [...this.netMocks.entries()].find(([pattern]) => urlMatchesGlob(url, pattern))
+      const respondOpts = { sessionId: eventSessionId }
       if (matched === undefined || params.requestId === undefined) {
         // Not mocked: continue the request untouched.
-        void active.client.send('Fetch.continueRequest', { requestId: params.requestId }, { sessionId: active.sessionId }).catch(() => undefined)
+        void client.send('Fetch.continueRequest', { requestId: params.requestId }, respondOpts).catch(() => undefined)
         return
       }
       const mock = matched[1]
       // Always include a permissive CORS header: mocked responses are for
       // the model's testing, and a cross-origin page fetch must not fail in
       // the CORS layer after the interception already succeeded.
-      await active.client.send('Fetch.fulfillRequest', {
+      void client.send('Fetch.fulfillRequest', {
         requestId: params.requestId,
         responseCode: mock.status,
         body: Buffer.from(mock.body, 'utf-8').toString('base64'),
@@ -1144,9 +1159,8 @@ export class ChromeRuntime extends Service {
           { name: 'Content-Type', value: mock.contentType },
           { name: 'Access-Control-Allow-Origin', value: '*' },
         ],
-      }, { sessionId: active.sessionId }).catch(() => undefined)
+      }, respondOpts).catch(() => undefined)
     })
-    this.fetchIntercepted = true
   }
 
   /**

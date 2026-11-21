@@ -268,6 +268,104 @@ console.log('\n== J. PDF + MHTML ==')
   } finally { await chrome.dispose().catch(() => {}); await settle(150) }
 }
 
+
+// ---------- K. connect reuse + close semantics ----------
+console.log('\n== K. Connect reuse + close semantics ==')
+{
+  const sharedPort = mkPort + 100
+  const owner = await mk({ port: sharedPort })
+  const info1 = await owner.ensureConnection('launch')
+  check('K1 launch reports launched', info1.connected === 'launched')
+  check('K2 owner owns browser process', owner.ownsBrowserProcess === true)
+
+  // A second runtime on the same port attaches (reuse) instead of launching.
+  const attacher = await mk({ port: sharedPort, reuseExisting: true })
+  const info2 = await attacher.ensureConnection('auto')
+  check('K3 auto attaches to existing instance', info2.connected === 'attached')
+  check('K4 attacher does not own process', attacher.ownsBrowserProcess === false)
+  check('K5 same browser endpoint shared', info2.endpoint === info1.endpoint)
+
+  // Attached instance survives attacher's closeBrowser; owner still works.
+  await attacher.closeBrowser()
+  const still = await owner.navigate(`${base}/`, 'load')
+  check('K6 attached close leaves reused instance serving', still.finalUrl.includes(base))
+
+  // Owner closes: managed child killed, port freed (attacher reconnect would now need a relaunch).
+  await owner.closeBrowser()
+  const freed = await (async () => { try { await fetch(`http://127.0.0.1:${sharedPort}/json/version`, { signal: AbortSignal.timeout(1500) }); return false } catch { return true } })()
+  check('K7 launched close kills the child (port freed)', freed)
+  await attacher.dispose().catch(() => {}); await settle(150)
+  await owner.dispose().catch(() => {}); await settle(150)
+}
+
+// ---------- L. connect launch conflict + explicit modes ----------
+console.log('\n== L. Connect modes error paths ==')
+{
+  const p = mkPort + 200
+  const a = await mk({ port: p })
+  await a.ensureConnection('launch')
+  const b = await mk({ port: p, reuseExisting: false })
+  let err = ''
+  try { await b.ensureConnection('launch') } catch (e) { err = e.message }
+  check('L1 launch on occupied port fails clearly', err.includes('already serving'))
+  const c = await mk({ port: p, reuseExisting: false })
+  let err2 = ''
+  try { await c.navigate(`${base}/`, 'load') } catch (e) { err2 = e.message }
+  check('L2 navigate under launch-only config on occupied port surfaces the error', err2.includes('already serving') || err2.length > 0)
+  // reuse mode works
+  const d = await mk({ port: p, reuseExisting: true })
+  const info = await d.ensureConnection('reuse')
+  check('L3 explicit reuse attaches', info.connected === 'attached')
+  await b.dispose().catch(() => {}); await c.dispose().catch(() => {}); await d.dispose().catch(() => {}); await settle(150)
+  await a.dispose().catch(() => {}); await settle(150)
+}
+
+// ---------- M. mock residual semantics (documented current behavior) ----------
+console.log('\n== M. Mock lifetime across connections (current behavior) ==')
+{
+  const chrome = await mk()
+  try {
+    await chrome.navigate(`${base}/`, 'load')
+    await chrome.netMock({ pattern: `${base}/api/data`, status: 500, body: '{"m":1}', contentType: 'application/json' })
+    // Same runtime, connection dropped and re-established (closeBrowser + reuse of... a fresh launch would need a new port; instead reconnect via navigate after dispose-less reconnect)
+    await chrome.closeTab()
+    await chrome.navigate(`${base}/`, 'domcontentloaded')
+    const r1 = await chrome.evaluate(`fetch('/api/data').then(r=>r.text()).catch(e=>'err')`)
+    check('M1 mock survives same-runtime reconnect', r1.result === '{"m":1}')
+    // New session via a tab switch: interception must re-arm automatically.
+    await chrome.openTab(`${base}/`)
+    const r2 = await chrome.evaluate(`fetch('/api/data').then(r=>r.text()).catch(e=>'err')`)
+    check('M2 mock works on switched-to new session', r2.result === '{"m":1}')
+    await chrome.netMockClear()
+    const r3 = await chrome.evaluate(`fetch('/api/data').then(r=>r.text()).catch(e=>'err')`)
+    check('M3 clear stops interception on new session', r3.result === '{"real":true}')
+  } finally { await chrome.dispose().catch(() => {}); await settle(150) }
+}
+
+// ---------- N. dialogs prompt text + waitUntil variants + snapshot/screenshot params ----------
+console.log('\n== N. Param variants ==')
+{
+  const chrome = await mk({ dialogPolicy: 'accept', dialogPromptText: 'sweep-prompt' })
+  try {
+    const promptPage = `data:text/html,<html><body><script>const a=prompt('name?');console.log('prompt-got:'+a);</script><h1>p</h1></body></html>`
+    await chrome.navigate(promptPage, 'domcontentloaded')
+    await settle(500)
+    const con = await chrome.consoleRead({ minLevel: 'log', all: true })
+    check('N1 prompt answered with dialogPromptText', con.entries.some(e => e.text.includes('prompt-got:sweep-prompt')))
+    // waitUntil variants on a normal page
+    await chrome.navigate(`${base}/`, 'domcontentloaded')
+    check('N2 domcontentloaded nav', true)
+    await chrome.navigate(`${base}/`, 'networkidle2')
+    check('N3 networkidle2 nav', true)
+    // snapshot truncation
+    const snap = await chrome.snapshot(30)
+    check('N4 snapshot maxChars truncates', snap.text.length <= 40 && snap.truncated === true)
+    // screenshot webp viewport-only
+    const shot = await chrome.screenshot({ format: 'webp', fullPage: false })
+    check('N5 screenshot webp viewport', shot.data.length > 100 && shot.mediaType === 'image/webp')
+  } finally { await chrome.dispose().catch(() => {}); await settle(150) }
+}
+
 await fs.rm(dir, { recursive: true, force: true })
 server.close()
 const failed = results.filter(r => !r[1])
