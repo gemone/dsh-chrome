@@ -12,6 +12,7 @@ import type { ContentBlock } from '@deepseek-ai/dsh-llm'
 import { defineTool } from '@deepseek-ai/dsh-tools'
 import type { GenericCallView } from '@deepseek-ai/dsh-tools'
 import type { ChromeRuntime } from '../service.ts'
+import type { ChromeSettings } from '../settings.ts'
 
 /** Canonical `chrome_snapshot` outcome. */
 export interface ChromeSnapshotValue {
@@ -24,18 +25,18 @@ export interface ChromeSnapshotValue {
 }
 
 /** Register `chrome_snapshot` and its prompt guidance. */
-export function applyChromeSnapshotTool(ctx: Context, chrome: ChromeRuntime, timeoutMs: number, maxChars: number): void {
-  ctx.systemPrompt.section({
+export function applyChromeSnapshotTool(ctx: Context, chrome: ChromeRuntime, settings: ChromeSettings): () => void {
+  const disposeSection = ctx.systemPrompt.section({
     name: 'tool:chrome_snapshot',
     order: 112,
     text: 'Use the chrome_snapshot tool to read the controlled Chrome page (bounded): format "text" returns the rendered visible text, format "markdown" converts the page to Markdown (headings, links, lists, tables, code). Use it to understand a page after chrome_navigate, especially when content is rendered by JavaScript.',
   })
 
-  ctx.tools.register(defineTool({
+  const disposeTool = ctx.tools.register(defineTool({
     name: 'chrome_snapshot',
     description: 'Read the controlled Chrome page (bounded). format "text" (default) returns the rendered body innerText; format "markdown" returns the page converted to GitHub-flavored Markdown. truncated flag indicates more content exists.',
     parameters: {
-      maxChars: { type: 'integer', description: `Maximum characters to return (default ${maxChars}).` },
+      maxChars: { type: 'integer', description: `Maximum characters to return (default ${settings.snapshotMaxChars()}).` },
       format: {
         type: 'string',
         description: 'Output format: "text" (default, rendered visible text) or "markdown" (GitHub-flavored Markdown conversion).',
@@ -59,14 +60,14 @@ export function applyChromeSnapshotTool(ctx: Context, chrome: ChromeRuntime, tim
         { type: 'text', text: `${formatSnapshot(value)}${chrome.activityHint()}` },
       ],
     },
-    timeoutMs,
+    timeoutMs: settings.operationTimeoutMs(),
     // Reads do not mutate parent-agent state.
     isConcurrencySafe: () => true,
     async execute(args, exec) {
       const format = args.format ?? 'text'
       const result = format === 'markdown'
-        ? await chrome.markdown(args.maxChars ?? maxChars, exec.signal)
-        : await chrome.snapshot(args.maxChars ?? maxChars, exec.signal)
+        ? await chrome.markdown(args.maxChars ?? settings.snapshotMaxChars(), exec.signal)
+        : await chrome.snapshot(args.maxChars ?? settings.snapshotMaxChars(), exec.signal)
       return {
         url: result.url,
         title: result.title,
@@ -80,6 +81,10 @@ export function applyChromeSnapshotTool(ctx: Context, chrome: ChromeRuntime, tim
       return { card: 'generic', title: `Snapshot page (${args.format ?? 'text'})`, kind: 'read' }
     },
   }))
+  return () => {
+    disposeTool()
+    disposeSection()
+  }
 }
 
 /** Model-facing text for one snapshot outcome. */

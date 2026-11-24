@@ -9,6 +9,7 @@ import { defineTool } from '@deepseek-ai/dsh-tools'
 import type { GenericCallView } from '@deepseek-ai/dsh-tools'
 import type { JsonValue } from '@deepseek-ai/dsh-util-values'
 import type { ChromeRuntime } from '../service.ts'
+import type { ChromeSettings } from '../settings.ts'
 
 /** Canonical `chrome_evaluate` outcome. */
 export interface ChromeEvaluateValue {
@@ -19,14 +20,14 @@ export interface ChromeEvaluateValue {
 }
 
 /** Register `chrome_evaluate` and its prompt guidance. */
-export function applyChromeEvaluateTool(ctx: Context, chrome: ChromeRuntime, timeoutMs: number): void {
-  ctx.systemPrompt.section({
+export function applyChromeEvaluateTool(ctx: Context, chrome: ChromeRuntime, settings: ChromeSettings): () => void {
+  const disposeSection = ctx.systemPrompt.section({
     name: 'tool:chrome_evaluate',
     order: 111,
     text: 'Use the chrome_evaluate tool to run JavaScript in the controlled Chrome page and read its JSON return value. A thrown exception is returned as exceptionDetails (a successful tool result), not an error. Use the DOM to extract data the page renders with JavaScript.',
   })
 
-  ctx.tools.register(defineTool({
+  const disposeTool = ctx.tools.register(defineTool({
     name: 'chrome_evaluate',
     description: 'Evaluate a JavaScript expression in the controlled Chrome page and return its JSON value. A thrown exception is returned as exceptionDetails.',
     parameters: {
@@ -57,7 +58,7 @@ export function applyChromeEvaluateTool(ctx: Context, chrome: ChromeRuntime, tim
         { type: 'text', text: formatEvaluate(value) },
       ],
     },
-    timeoutMs,
+    timeoutMs: settings.operationTimeoutMs(),
     async execute(args, exec) {
       if (args.expression.trim().length === 0) throw new Error('expression must be a non-empty string')
       const result = await chrome.evaluate(args.expression, {
@@ -75,6 +76,10 @@ export function applyChromeEvaluateTool(ctx: Context, chrome: ChromeRuntime, tim
       return { card: 'generic', title: `Evaluate JS`, kind: 'execute', rawInput: expr }
     },
   }))
+  return () => {
+    disposeTool()
+    disposeSection()
+  }
 }
 
 /** Model-facing text for one evaluation outcome. */

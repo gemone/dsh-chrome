@@ -8,6 +8,7 @@ import type { ContentBlock } from '@deepseek-ai/dsh-llm'
 import { defineTool } from '@deepseek-ai/dsh-tools'
 import type { GenericCallView } from '@deepseek-ai/dsh-tools'
 import type { ChromeRuntime } from '../service.ts'
+import type { ChromeSettings } from '../settings.ts'
 import { resolveTargetSelector } from './ref-target.ts'
 
 /** Canonical `chrome_scroll` outcome. */
@@ -20,14 +21,14 @@ export interface ChromeScrollValue {
 }
 
 /** Register `chrome_scroll` and its prompt guidance. */
-export function applyChromeScrollTool(ctx: Context, chrome: ChromeRuntime, timeoutMs: number): void {
-  ctx.systemPrompt.section({
+export function applyChromeScrollTool(ctx: Context, chrome: ChromeRuntime, settings: ChromeSettings): () => void {
+  const disposeSection = ctx.systemPrompt.section({
     name: 'tool:chrome_scroll',
     order: 115,
     text: 'Use the chrome_scroll tool to scroll the page or a specific element. Supports vertical and horizontal scrolling by pixel amount, or scrolling an element into view by CSS selector or chrome_page_snapshot ref.',
   })
 
-  ctx.tools.register(defineTool({
+  const disposeTool = ctx.tools.register(defineTool({
     name: 'chrome_scroll',
     description: 'Scroll the page or a specific element into view. Supports up/down/left/right by pixel amount, or scroll to a CSS selector or chrome_page_snapshot ref.',
     parameters: {
@@ -57,7 +58,7 @@ export function applyChromeScrollTool(ctx: Context, chrome: ChromeRuntime, timeo
         return [{ type: 'text', text: `Scrolled to ${at}. Position: (${value.scrollX}, ${value.scrollY}). Page height: ${value.scrollHeight}px.` }]
       },
     },
-    timeoutMs,
+    timeoutMs: settings.operationTimeoutMs(),
     isConcurrencySafe: () => true,
     async execute(args, exec) {
       const direction = args.direction ?? 'down'
@@ -86,4 +87,8 @@ export function applyChromeScrollTool(ctx: Context, chrome: ChromeRuntime, timeo
       return { card: 'generic', title: `Scroll: ${target}`, kind: 'read', rawInput: target }
     },
   }))
+  return () => {
+    disposeTool()
+    disposeSection()
+  }
 }

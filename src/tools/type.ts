@@ -11,6 +11,7 @@ import type { ContentBlock } from '@deepseek-ai/dsh-llm'
 import { defineTool } from '@deepseek-ai/dsh-tools'
 import type { GenericCallView } from '@deepseek-ai/dsh-tools'
 import type { ChromeRuntime } from '../service.ts'
+import type { ChromeSettings } from '../settings.ts'
 import { ChromeError } from '../types.ts'
 import { normalizePageRef } from '../page-walker.ts'
 import { resolveRefSelector } from './ref-target.ts'
@@ -23,14 +24,14 @@ export interface ChromeTypeValue {
 }
 
 /** Register `chrome_type` and its prompt guidance. */
-export function applyChromeTypeTool(ctx: Context, chrome: ChromeRuntime, timeoutMs: number): void {
-  ctx.systemPrompt.section({
+export function applyChromeTypeTool(ctx: Context, chrome: ChromeRuntime, settings: ChromeSettings): () => void {
+  const disposeSection = ctx.systemPrompt.section({
     name: 'tool:chrome_type',
     order: 116,
     text: 'Use the chrome_type tool to type text into a focused element via real keyboard events. Target the input by CSS selector or by a chrome_page_snapshot ref; with neither it types into whatever is focused. It triggers native input events that React/Vue/Angular frameworks handle correctly. Prefer this over evaluate+setter for form input.',
   })
 
-  ctx.tools.register(defineTool({
+  const disposeTool = ctx.tools.register(defineTool({
     name: 'chrome_type',
     description: 'Type text into a focused element using real keyboard events. Triggers native input events that frameworks handle correctly. Optionally focus a target first by CSS selector or chrome_page_snapshot ref.',
     parameters: {
@@ -52,7 +53,7 @@ export function applyChromeTypeTool(ctx: Context, chrome: ChromeRuntime, timeout
         { type: 'text', text: value.typed ? `Typed into ${value.selector ?? 'focused element'}. Value: "${value.valueAfter}"` : `Failed to type into ${value.selector ?? 'focused element'}.` },
       ],
     },
-    timeoutMs,
+    timeoutMs: settings.operationTimeoutMs(),
     async execute(args, exec) {
       if (args.text.length === 0) throw new Error('text must be a non-empty string')
 
@@ -99,4 +100,8 @@ export function applyChromeTypeTool(ctx: Context, chrome: ChromeRuntime, timeout
       return { card: 'generic', title: `Type into ${target}`, kind: 'edit', rawInput: args.text }
     },
   }))
+  return () => {
+    disposeTool()
+    disposeSection()
+  }
 }

@@ -142,9 +142,30 @@ export class Observatory {
   private droppedNet = 0
   private droppedConsole = 0
 
-  constructor(private readonly maxEntries: number = DEFAULT_OBSERVATORY_MAX_ENTRIES) {
+  constructor(private maxEntries: number = DEFAULT_OBSERVATORY_MAX_ENTRIES) {
     if (!Number.isInteger(maxEntries) || maxEntries < 1) {
       throw new Error('observatory maxEntries must be a positive integer')
+    }
+  }
+
+  /**
+   * Change the ring capacity live and evict the overflow immediately. Used by
+   * the live-settings path when the plugin's `observatoryMaxEntries` setting
+   * is edited while a connection is open.
+   */
+  resize(maxEntries: number): void {
+    if (!Number.isInteger(maxEntries) || maxEntries < 1) {
+      throw new Error('observatory maxEntries must be a positive integer')
+    }
+    this.maxEntries = maxEntries
+    while (this.netEntries.length > maxEntries) {
+      const evicted = this.netEntries.shift()
+      if (evicted !== undefined) this.netById.delete(evicted.requestId)
+      this.droppedNet++
+    }
+    while (this.consoleEntries.length > maxEntries) {
+      this.consoleEntries.shift()
+      this.droppedConsole++
     }
   }
 

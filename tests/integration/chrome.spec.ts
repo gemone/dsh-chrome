@@ -2,6 +2,7 @@ import { afterAll, beforeAll, describe, expect, it } from 'vitest'
 import { createServer, type Server } from 'node:http'
 import { Context } from '@deepseek-ai/cordis'
 import { ChromeRuntime } from '../../src/service.ts'
+import { ChromeError } from '../../src/types.ts'
 import { discoverExecutable } from '../../src/launcher.ts'
 
 const ENABLED = process.env.DSH_CHROME_INTEGRATION === '1'
@@ -56,13 +57,17 @@ describe.skipIf(!runnable)('ChromeRuntime against a real Chrome', { timeout: 60_
     const ctx = new Context()
     chrome = new ChromeRuntime(ctx, {
       launch: true,
-      reuseExisting: true,
+      reuseExisting: () => true,
       port: debugPort,
       host: '127.0.0.1',
       headless: 'new',
       extraArgs: [],
-      operationTimeoutMs: 30_000,
-      networkIdleMs: 300,
+      operationTimeoutMs: () => 30_000,
+      networkIdleMs: () => 300,
+      observatoryMaxEntries: () => 500,
+      dialogPolicy: () => 'accept',
+      dialogPromptText: () => undefined,
+      downloadDir: () => undefined,
     })
   })
 
@@ -225,13 +230,18 @@ describe.skipIf(!runnable)('debugger-port reuse against a real Chrome', { timeou
   function config(port: number): Parameters<typeof ChromeRuntime>[1] {
     return {
       launch: true,
-      reuseExisting: true,
+      reuseExisting: () => true,
       port,
       host: '127.0.0.1',
       headless: 'new',
       extraArgs: [],
-      operationTimeoutMs: 30_000,
-      networkIdleMs: 300,
+      operationTimeoutMs: () => 30_000,
+      networkIdleMs: () => 300,
+      observatoryMaxEntries: () => 500,
+      dialogPolicy: () => 'accept',
+      dialogPromptText: () => undefined,
+      downloadDir: () => undefined,
+      occupiedPortPolicy: () => 'refuse',
     }
   }
 
@@ -287,6 +297,77 @@ describe.skipIf(!runnable)('debugger-port reuse against a real Chrome', { timeou
       await expect(d.ensureConnection('reuse')).rejects.toMatchObject({ code: 'CHROME_ENDPOINT_UNREACHABLE' })
     } finally {
       await d.dispose()
+    }
+  })
+})
+
+describe.skipIf(!runnable)('fresh launch onto an occupied port follows occupiedPortPolicy', { timeout: 90_000 }, () => {
+  /** Runtime config for launch mode against a specific port. */
+  function config(port: number, policy: 'reuse' | 'refuse' = 'refuse'): Parameters<typeof ChromeRuntime>[1] {
+    return {
+      launch: true,
+      reuseExisting: () => false,
+      port,
+      host: '127.0.0.1',
+      headless: 'new',
+      extraArgs: [],
+      operationTimeoutMs: () => 30_000,
+      networkIdleMs: () => 300,
+      observatoryMaxEntries: () => 500,
+      dialogPolicy: () => 'accept',
+      dialogPromptText: () => undefined,
+      downloadDir: () => undefined,
+      occupiedPortPolicy: () => policy,
+    }
+  }
+
+  it('policy "reuse" attaches to the running Chrome without asking', async () => {
+    const debugPort = await freePort()
+    const owner = new ChromeRuntime(new Context(), config(debugPort))
+    try {
+      const first = await owner.ensureConnection('launch')
+      expect(first.connected).toBe('launched')
+      // A second runtime in fresh-launch mode finds the port served and
+      // follows the reuse policy.
+      const second = new ChromeRuntime(new Context(), config(debugPort, 'reuse'))
+      try {
+        const info = await second.ensureConnection('launch')
+        expect(info.connected).toBe('attached')
+        expect(info.endpoint).toBe(first.endpoint)
+        // Attached, never owned: disposing the reuser must leave the first
+        // Chrome alive.
+        expect(second.ownsBrowserProcess).toBe(false)
+      } finally {
+        await second.dispose()
+      }
+      const still = await owner.ensureConnection('auto')
+      // The owner's own Chrome is still alive and serving after the reuser
+      // detached (its "connected" stays "launched" — it owns this browser).
+      expect(still.endpoint).toBe(first.endpoint)
+    } finally {
+      await owner.dispose()
+    }
+  })
+
+  it('policy "refuse" fails with CHROME_LAUNCH_FAILED and leaves the served Chrome untouched', async () => {
+    const debugPort = await freePort()
+    const owner = new ChromeRuntime(new Context(), config(debugPort))
+    try {
+      const first = await owner.ensureConnection('launch')
+      expect(first.connected).toBe('launched')
+      const second = new ChromeRuntime(new Context(), config(debugPort, 'refuse'))
+      try {
+        const error = await second.ensureConnection('launch').catch((e: unknown) => e)
+        expect(error).toBeInstanceOf(ChromeError)
+        expect((error as ChromeError).code).toBe('CHROME_LAUNCH_FAILED')
+        expect((error as ChromeError).message).toMatch(/already serving/)
+      } finally {
+        await second.dispose()
+      }
+      const still = await owner.ensureConnection('auto')
+      expect(still.endpoint).toBe(first.endpoint)
+    } finally {
+      await owner.dispose()
     }
   })
 })

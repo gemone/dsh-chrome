@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "Page interaction",
+    "description": "Click, type, scroll, and send keyboard input (chrome_click / chrome_type / chrome_scroll / chrome_press_key)."
+  }
+}

@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "Tabs & storage",
+    "description": "Tab management, cookies and web storage, file uploads, environment emulation, and request mocks (chrome_tab / chrome_storage / chrome_upload / chrome_emulate / chrome_net_mock)."
+  }
+}

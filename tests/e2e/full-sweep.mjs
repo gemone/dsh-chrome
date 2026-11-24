@@ -11,7 +11,7 @@ let unhandled = 0
 process.on('unhandledRejection', r => { unhandled++; console.log('  [unhandledRejection]', String(r).slice(0, 100)) })
 
 let mkPort = 9410
-const mk = async (cfg) => { const runtime = new ChromeRuntime(new Context(), { launch: true, port: mkPort++, host: '127.0.0.1', headless: 'new', extraArgs: ['--no-sandbox', '--disable-dev-shm-usage'], operationTimeoutMs: 20000, networkIdleMs: 400, ...cfg }); return runtime }
+const mk = async (cfg) => { const runtime = new ChromeRuntime(new Context(), { launch: true, port: mkPort++, host: '127.0.0.1', headless: 'new', extraArgs: ['--no-sandbox', '--disable-dev-shm-usage'], operationTimeoutMs: () => 20000, networkIdleMs: () => 400, observatoryMaxEntries: () => 500, dialogPolicy: () => 'accept', dialogPromptText: () => undefined, downloadDir: () => undefined, ...cfg }); return runtime }
 
 // ---------- test fixture ----------
 const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'sweep2-'))

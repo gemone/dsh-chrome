@@ -276,6 +276,11 @@ export function createCdpClient(url: string, signal?: AbortSignal): Promise<CdpC
     const onAbort = (): void => {
       cleanup()
       try {
+        // Closing a socket whose handshake never finished makes `ws` emit a
+        // late 'error' ("WebSocket was closed before the connection was
+        // established"); with the listeners already removed it would escape
+        // as an unhandled event and could crash the process.
+        socket.on('error', () => {})
         socket.close()
       } catch {
         // ignore

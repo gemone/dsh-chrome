@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "页面读取",
+    "description": "打开网址、执行 JavaScript、把页面读成文本或结构化元素树（chrome_navigate / chrome_evaluate / chrome_snapshot / chrome_page_snapshot）。"
+  }
+}

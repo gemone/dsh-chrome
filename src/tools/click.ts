@@ -10,6 +10,7 @@ import type { ContentBlock } from '@deepseek-ai/dsh-llm'
 import { defineTool } from '@deepseek-ai/dsh-tools'
 import type { GenericCallView } from '@deepseek-ai/dsh-tools'
 import type { ChromeRuntime } from '../service.ts'
+import type { ChromeSettings } from '../settings.ts'
 import type { MouseButton } from '../types.ts'
 import { resolveTargetSelector } from './ref-target.ts'
 
@@ -23,14 +24,14 @@ export interface ChromeClickValue {
 }
 
 /** Register `chrome_click` and its prompt guidance. */
-export function applyChromeClickTool(ctx: Context, chrome: ChromeRuntime, timeoutMs: number): void {
-  ctx.systemPrompt.section({
+export function applyChromeClickTool(ctx: Context, chrome: ChromeRuntime, settings: ChromeSettings): () => void {
+  const disposeSection = ctx.systemPrompt.section({
     name: 'tool:chrome_click',
     order: 113,
     text: 'Use the chrome_click tool to click the center of an element in the controlled Chrome page. Pass either a CSS selector or, preferably, a ref id ("e12") copied from chrome_page_snapshot. Returns whether an element was found and clicked.',
   })
 
-  ctx.tools.register(defineTool({
+  const disposeTool = ctx.tools.register(defineTool({
     name: 'chrome_click',
     description: 'Click the center of an element in the controlled Chrome page. Dispatches a real mouse event. Target it by CSS selector or by the [ref=eN] id from chrome_page_snapshot.',
     parameters: {
@@ -62,7 +63,7 @@ export function applyChromeClickTool(ctx: Context, chrome: ChromeRuntime, timeou
         },
       ],
     },
-    timeoutMs,
+    timeoutMs: settings.operationTimeoutMs(),
     async execute(args, exec) {
       const selector = resolveTargetSelector(chrome, args)
       const button = (args.button ?? 'left') as MouseButton
@@ -81,4 +82,8 @@ export function applyChromeClickTool(ctx: Context, chrome: ChromeRuntime, timeou
       return { card: 'generic', title: `Click ${target}`, kind: 'execute', rawInput: target }
     },
   }))
+  return () => {
+    disposeTool()
+    disposeSection()
+  }
 }

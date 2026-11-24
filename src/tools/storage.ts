@@ -10,6 +10,7 @@ import type { ContentBlock } from '@deepseek-ai/dsh-llm'
 import { defineTool } from '@deepseek-ai/dsh-tools'
 import type { GenericCallView } from '@deepseek-ai/dsh-tools'
 import type { ChromeRuntime } from '../service.ts'
+import type { ChromeSettings } from '../settings.ts'
 
 /** Canonical `chrome_storage` outcome. */
 export interface ChromeStorageValue {
@@ -17,14 +18,14 @@ export interface ChromeStorageValue {
 }
 
 /** Register `chrome_storage` with its prompt guidance. */
-export function applyChromeStorageTool(ctx: Context, chrome: ChromeRuntime, timeoutMs: number): void {
-  ctx.systemPrompt.section({
+export function applyChromeStorageTool(ctx: Context, chrome: ChromeRuntime, settings: ChromeSettings): () => void {
+  const disposeSection = ctx.systemPrompt.section({
     name: 'tool:chrome_storage',
     order: 117,
     text: 'Use the chrome_storage tool to inspect or change the controlled Chrome page\'s state: cookies (kind "cookies", scoped to the current page URL) and localStorage/sessionStorage (kinds "local"/"session", current origin). Operations: get, set, remove, clear. Cookie and storage values are sensitive — echo them only when the task needs them.',
   })
 
-  ctx.tools.register(defineTool({
+  const disposeTool = ctx.tools.register(defineTool({
     name: 'chrome_storage',
     description: 'Inspect or change the controlled Chrome page\'s state: cookies (kind "cookies"; get/set/remove/clear, scoped to the current page URL unless url is given) and localStorage/sessionStorage (kinds "local"/"session", current origin). Values are sensitive — do not echo them unnecessarily.',
     parameters: {
@@ -53,7 +54,7 @@ export function applyChromeStorageTool(ctx: Context, chrome: ChromeRuntime, time
       },
       render: (_args, value): ContentBlock[] => [{ type: 'text', text: value.text }],
     },
-    timeoutMs,
+    timeoutMs: settings.operationTimeoutMs(),
     isConcurrencySafe: () => true,
     async execute(args, exec) {
       const result = await chrome.storage({
@@ -78,4 +79,8 @@ export function applyChromeStorageTool(ctx: Context, chrome: ChromeRuntime, time
       return { card: 'generic', title: `Storage ${args.operation ?? 'get'} (${args.kind})`, kind: args.operation === undefined || args.operation === 'get' ? 'read' : 'edit' }
     },
   }))
+  return () => {
+    disposeTool()
+    disposeSection()
+  }
 }

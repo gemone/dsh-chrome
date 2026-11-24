@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "Network & console",
+    "description": "Observe the page’s own network requests, console output, and exceptions (chrome_net_list / chrome_net_body / chrome_console_read)."
+  }
+}

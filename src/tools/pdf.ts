@@ -10,6 +10,7 @@ import { defineTool } from '@deepseek-ai/dsh-tools'
 import type { GenericCallView } from '@deepseek-ai/dsh-tools'
 import { paperFormatError } from '../emulation.ts'
 import type { ChromeRuntime } from '../service.ts'
+import type { ChromeSettings } from '../settings.ts'
 
 /** Canonical `chrome_pdf` outcome. */
 export interface ChromePdfValue {
@@ -18,14 +19,14 @@ export interface ChromePdfValue {
 }
 
 /** Register `chrome_pdf` with its prompt guidance. */
-export function applyChromePdfTool(ctx: Context, chrome: ChromeRuntime, timeoutMs: number): void {
-  ctx.systemPrompt.section({
+export function applyChromePdfTool(ctx: Context, chrome: ChromeRuntime, settings: ChromeSettings): () => void {
+  const disposeSection = ctx.systemPrompt.section({
     name: 'tool:chrome_pdf',
     order: 116,
     text: 'Use the chrome_pdf tool to print the controlled Chrome page to a PDF file at an absolute path (created recursively). Supports landscape, printBackground, paperFormat (Letter/Legal/Tabloid/Ledger/A0–A6), scale, and pageRanges. Good for full-page archives; prefer chrome_screenshot for images.',
   })
 
-  ctx.tools.register(defineTool({
+  const disposeTool = ctx.tools.register(defineTool({
     name: 'chrome_pdf',
     description: 'Print the controlled Chrome page to a PDF file. path is the absolute destination path (created recursively). Options: landscape, printBackground (default true), paperFormat (Letter/Legal/Tabloid/Ledger/A0-A6), scale (0.1-2), pageRanges (e.g. "1-3, 5").',
     parameters: {
@@ -49,7 +50,7 @@ export function applyChromePdfTool(ctx: Context, chrome: ChromeRuntime, timeoutM
         { type: 'text', text: `PDF written to ${value.path} (${value.bytes} bytes).` },
       ],
     },
-    timeoutMs,
+    timeoutMs: settings.operationTimeoutMs(),
     isConcurrencySafe: () => false,
     async execute(args, exec) {
       if (args.path.trim().length === 0) throw new Error('path must be a non-empty string')
@@ -76,4 +77,8 @@ export function applyChromePdfTool(ctx: Context, chrome: ChromeRuntime, timeoutM
       return { card: 'generic', title: `Print to PDF → ${args.path}`, kind: 'edit' }
     },
   }))
+  return () => {
+    disposeTool()
+    disposeSection()
+  }
 }

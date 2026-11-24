@@ -11,6 +11,7 @@ import type { ContentBlock } from '@deepseek-ai/dsh-llm'
 import { defineTool } from '@deepseek-ai/dsh-tools'
 import type { GenericCallView } from '@deepseek-ai/dsh-tools'
 import type { ChromeRuntime } from '../service.ts'
+import type { ChromeSettings } from '../settings.ts'
 
 /** Canonical `chrome_press_key` outcome. */
 export interface ChromePressKeyValue {
@@ -54,14 +55,14 @@ function resolveKey(key: string): { code: string; keyCode: number } {
 }
 
 /** Register `chrome_press_key` and its prompt guidance. */
-export function applyChromePressKeyTool(ctx: Context, chrome: ChromeRuntime, timeoutMs: number): void {
-  ctx.systemPrompt.section({
+export function applyChromePressKeyTool(ctx: Context, chrome: ChromeRuntime, settings: ChromeSettings): () => void {
+  const disposeSection = ctx.systemPrompt.section({
     name: 'tool:chrome_press_key',
     order: 117,
     text: 'Use the chrome_press_key tool to press a single keyboard key: Enter, Tab, Escape, Backspace, arrows, F-keys, etc. Dispatches real keyboard events via the DevTools Protocol.',
   })
 
-  ctx.tools.register(defineTool({
+  const disposeTool = ctx.tools.register(defineTool({
     name: 'chrome_press_key',
     description: 'Press a single keyboard key (Enter, Tab, Escape, Backspace, arrows, F-keys, etc.) via real keyboard events.',
     parameters: {
@@ -82,7 +83,7 @@ export function applyChromePressKeyTool(ctx: Context, chrome: ChromeRuntime, tim
         { type: 'text', text: value.pressed ? `Pressed ${value.key} (${value.code}).` : `Failed to press ${value.key}.` },
       ],
     },
-    timeoutMs,
+    timeoutMs: settings.operationTimeoutMs(),
     async execute(args, exec) {
       if (args.key.length === 0) throw new Error('key must be a non-empty string')
 
@@ -127,4 +128,8 @@ export function applyChromePressKeyTool(ctx: Context, chrome: ChromeRuntime, tim
       return { card: 'generic', title: `Press ${args.key}`, kind: 'execute', rawInput: args.key }
     },
   }))
+  return () => {
+    disposeTool()
+    disposeSection()
+  }
 }

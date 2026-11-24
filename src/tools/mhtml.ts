@@ -9,6 +9,7 @@ import type { ContentBlock } from '@deepseek-ai/dsh-llm'
 import { defineTool } from '@deepseek-ai/dsh-tools'
 import type { GenericCallView } from '@deepseek-ai/dsh-tools'
 import type { ChromeRuntime } from '../service.ts'
+import type { ChromeSettings } from '../settings.ts'
 
 /** Canonical `chrome_mhtml` outcome. */
 export interface ChromeMhtmlValue {
@@ -17,14 +18,14 @@ export interface ChromeMhtmlValue {
 }
 
 /** Register `chrome_mhtml` with its prompt guidance. */
-export function applyChromeMhtmlTool(ctx: Context, chrome: ChromeRuntime, timeoutMs: number): void {
-  ctx.systemPrompt.section({
+export function applyChromeMhtmlTool(ctx: Context, chrome: ChromeRuntime, settings: ChromeSettings): () => void {
+  const disposeSection = ctx.systemPrompt.section({
     name: 'tool:chrome_mhtml',
     order: 123,
     text: 'Use the chrome_mhtml tool to archive the whole page (layout + inline resources, images included) as a single MHTML file at an absolute path. Use it for complete page archives; use chrome_pdf for printable documents and chrome_screenshot for images.',
   })
 
-  ctx.tools.register(defineTool({
+  const disposeTool = ctx.tools.register(defineTool({
     name: 'chrome_mhtml',
     description: 'Archive the whole controlled Chrome page (layout + inline resources) as a single MHTML file at an absolute path (created recursively). Complete offline copy of the page; use chrome_pdf for printable documents and chrome_screenshot for images.',
     parameters: {
@@ -43,7 +44,7 @@ export function applyChromeMhtmlTool(ctx: Context, chrome: ChromeRuntime, timeou
         { type: 'text', text: `MHTML archive written to ${value.path} (${value.bytes} bytes).` },
       ],
     },
-    timeoutMs,
+    timeoutMs: settings.operationTimeoutMs(),
     isConcurrencySafe: () => false,
     async execute(args, exec) {
       if (args.path.trim().length === 0) throw new Error('path must be a non-empty string')
@@ -56,4 +57,8 @@ export function applyChromeMhtmlTool(ctx: Context, chrome: ChromeRuntime, timeou
       return { card: 'generic', title: `Archive MHTML → ${args.path}`, kind: 'edit' }
     },
   }))
+  return () => {
+    disposeTool()
+    disposeSection()
+  }
 }

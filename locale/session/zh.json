@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "标签页与存储",
+    "description": "标签页管理、Cookie 与 Web 存储、文件上传、环境模拟和请求模拟（chrome_tab / chrome_storage / chrome_upload / chrome_emulate / chrome_net_mock）。"
+  }
+}

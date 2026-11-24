@@ -22,14 +22,15 @@ import { CdpClient, createCdpClient } from './cdp.ts'
 import { networkConditions } from './emulation.ts'
 import { urlMatchesGlob } from './url-glob.ts'
 import { formatAxTree, storageReadExpression, storageWriteExpression, type RawAxNode } from './a11y.ts'
-import { disposeChild, fetchVersionInfo, launchChrome, normalizeDebugEndpoint, probeExistingEndpoint, type ChromeVersionInfo, type LaunchedChrome } from './launcher.ts'
+import { DEFAULT_WS_PROBE_TIMEOUT_MS, disposeChild, fetchVersionInfo, findFreePort, launchChrome, normalizeDebugEndpoint, probeEndpointPresence, probeExistingEndpoint, type ChromeVersionInfo, type LaunchedChrome } from './launcher.ts'
+import { DEFAULT_PAGE_SNAPSHOT_MAX_NODES } from './page-walker.ts'
+import { DEFAULT_SNAPSHOT_MAX_CHARS, type ChromeSettings } from './settings.ts'
 import { markdownExpression, type RawMarkdownSnapshot } from './markdown.ts'
 import { pageSnapshotExpression, type RawPageSnapshot } from './page-walker.ts'
 import {
   Observatory,
   DEFAULT_NET_BODY_MAX_CHARS,
   DEFAULT_STORAGE_VALUE_MAX_CHARS,
-  DEFAULT_OBSERVATORY_MAX_ENTRIES,
   formatActivityHint as formatActivityHintSafe,
   type ConsoleLevel,
   type ConsoleReadResult,
@@ -61,7 +62,7 @@ export interface ChromeRuntimeConfig {
    * to an instance already listening there instead of spawning a second
    * Chrome over the same port. False = always launch (the port must be free).
    */
-  readonly reuseExisting: boolean
+  readonly reuseExisting: () => boolean
   /** Remote debugging port for a launched Chrome. */
   readonly port: number
   /** Host a launched Chrome binds its endpoint on. */
@@ -72,16 +73,25 @@ export interface ChromeRuntimeConfig {
   readonly userDataDir?: string
   /** Extra raw Chrome CLI flags. */
   readonly extraArgs: readonly string[]
-  /** Per-operation timeout (ms) used as a cooperative backstop inside the service. */
-  readonly operationTimeoutMs: number
-  /** Default quiet window before `networkidle*` is declared. */
-  readonly networkIdleMs: number
-  /** How to answer JS dialogs (alert/confirm/prompt/beforeunload). Default "accept". */
-  readonly dialogPolicy?: 'accept' | 'dismiss'
-  /** Prompt text sent when answering a `prompt` dialog under "accept". */
-  readonly dialogPromptText?: string
-  /** Directory downloads are redirected into (absolute path). Unset = browser default handling. */
-  readonly downloadDir?: string
+  /**
+   * Per-operation timeout (ms), read live at each use so a settings edit
+   * applies to the next operation without restarting the plugin.
+   */
+  readonly operationTimeoutMs: () => number
+  /** `chrome_connect` budget (ms), read live per connect. */
+  readonly connectTimeoutMs: () => number
+  /** Default quiet window before `networkidle*` is declared (ms), read live. */
+  readonly networkIdleMs: () => number
+  /** Ring-buffer capacity per observatory stream, read live per connection. */
+  readonly observatoryMaxEntries: () => number
+  /** How to answer JS dialogs, read live per dialog (default "accept"). */
+  readonly dialogPolicy: () => 'accept' | 'dismiss'
+  /** Prompt text sent when answering a `prompt` dialog under "accept", read live. */
+  readonly dialogPromptText: () => string | undefined
+  /** Directory downloads are redirected into (absolute path), read live. */
+  readonly downloadDir: () => string | undefined
+  /** What a fresh launch does when the configured port is already served (read live). */
+  readonly occupiedPortPolicy: () => 'reuse' | 'refuse'
 }
 
 declare module '@deepseek-ai/cordis' {
@@ -137,6 +147,8 @@ interface ActiveConnection {
   readonly observatory: Observatory
   /** What the model has already seen — the "since" cursors for auto-hints. */
   readonly readCursors: { net: number; console: number }
+  /** CDP event disposers for this session's trackers, unwound on recovery. */
+  readonly listeners: (() => void)[]
   /**
    * Ref id to CSS selector from the most recent `pageSnapshot()`. Mutated in
    * place: navigation clears it, each snapshot replaces it wholesale.
@@ -150,11 +162,37 @@ interface ActiveConnection {
  */
 export class ChromeRuntime extends Service {
   private state: ConnectionState = { kind: 'idle' }
-  /** Ring-buffer capacity for new observatories; set by the plugin config. */
-  observatoryCapacity: number = DEFAULT_OBSERVATORY_MAX_ENTRIES
+  /** In-flight dead-session recovery, shared by concurrent ensure() callers. */
+  private recovery?: Promise<ActiveConnection>
 
-  constructor(ctx: Context, private readonly config: ChromeRuntimeConfig) {
+  private readonly config: ChromeRuntimeConfig
+
+  /**
+   * The live settings view this runtime was built over. Family component rows
+   * (which inject `chrome` instead of carrying their own config) read their
+   * registration-time values — e.g. the declared `timeoutMs` — from here, so
+   * a live settings edit on the core row applies to them through the
+   * `chrome/registrations-changed` event.
+   */
+  readonly settings: ChromeSettings
+
+  constructor(ctx: Context, config: ChromeRuntimeConfig, settings?: ChromeSettings) {
     super(ctx, 'chrome')
+    this.config = config
+    this.settings = settings ?? {
+      reuseExisting: config.reuseExisting,
+      operationTimeoutMs: config.operationTimeoutMs,
+      connectTimeoutMs: config.connectTimeoutMs,
+      networkIdleMs: config.networkIdleMs,
+      snapshotMaxChars: () => DEFAULT_SNAPSHOT_MAX_CHARS,
+      pageSnapshotMaxNodes: () => DEFAULT_PAGE_SNAPSHOT_MAX_NODES,
+      observatoryMaxEntries: config.observatoryMaxEntries,
+      dialogPolicy: config.dialogPolicy,
+      dialogPromptText: config.dialogPromptText,
+      downloadDir: config.downloadDir,
+      analysisRoute: () => undefined,
+      occupiedPortPolicy: config.occupiedPortPolicy,
+    }
     // Tear down the lazy Chrome resources with the owning fiber, whether or not
     // a connection was ever opened. The disposer is async; unloading awaits it.
     this.ctx.effect(() => () => { void this.dispose() }, 'chrome.dispose')
@@ -176,10 +214,19 @@ export class ChromeRuntime extends Service {
    * @returns the active connection.
    */
   private async ensure(signal?: AbortSignal, mode?: ChromeConnectMode): Promise<ActiveConnection> {
-    const connectMode = mode ?? (this.config.reuseExisting ? 'auto' : 'launch')
+    const connectMode = mode ?? (this.config.reuseExisting() ? 'auto' : 'launch')
     if (this.state.kind === 'connected') {
       const active = this.state.active
-      if (!active.client.isClosed) return active
+      if (!active.client.isClosed) {
+        // The flattened page session can die under us (the user closes the
+        // tab, the target crashes or is replaced): verify it before trusting
+        // it, so one stale session id cannot wedge every later call.
+        if (await this.sessionAlive(active, signal)) return active
+        if (this.recovery === undefined) {
+          this.recovery = this.recoverPageTarget(active, signal).finally(() => { this.recovery = undefined })
+        }
+        return this.recovery
+      }
       // Socket died: drop it and reconnect.
       await this.closeActive(active).catch(() => undefined)
       this.state = { kind: 'idle' }
@@ -211,6 +258,44 @@ export class ChromeRuntime extends Service {
     }
   }
 
+  /** Cheap liveness probe for the flattened page session (one trivial evaluate). */
+  private async sessionAlive(active: ActiveConnection, signal?: AbortSignal): Promise<boolean> {
+    try {
+      await active.client.send('Runtime.evaluate', { expression: '1', returnByValue: true }, { sessionId: active.sessionId, signal })
+      return true
+    } catch {
+      // Any failure (session not found, crashed target, socket trouble) counts
+      // as dead; the recovery path below re-establishes a working session.
+      return false
+    }
+  }
+
+  /** Whether the page target itself still exists (browser-level check, no session needed). */
+  private async targetExists(active: ActiveConnection, signal?: AbortSignal): Promise<boolean> {
+    try {
+      const info = await active.client.send('Target.getTargetInfo', { targetId: active.targetId }, { signal }) as { targetInfo?: { targetId?: string } }
+      return info.targetInfo?.targetId === active.targetId
+    } catch {
+      return false
+    }
+  }
+
+  /**
+   * Replace a dead page session: re-attach to the same target while it still
+   * exists (a session-only death), otherwise open a fresh page target on the
+   * same browser connection. The old connection's event listeners stay wired
+   * but only ever observe its dead session id, so recovery never leaks live
+   * duplicates; the browser-level connection (and a reused Chrome) survives.
+   */
+  private async recoverPageTarget(active: ActiveConnection, signal?: AbortSignal): Promise<ActiveConnection> {
+    for (const off of active.listeners) off()
+    const sameTarget = (await this.targetExists(active, signal).catch(() => false)) ? active.targetId : undefined
+    this.state = { kind: 'connected-browser', client: active.client, endpoint: active.endpoint, browser: active.browser, launched: active.launched }
+    const fresh = await this.createTargetOnClient(active.client, { endpoint: active.endpoint, browser: active.browser, launched: active.launched }, signal, sameTarget)
+    this.state = { kind: 'connected', active: fresh }
+    return fresh
+  }
+
   /**
    * Ensure a live connection using an explicit strategy and report what is
    * now driving the tools. This is the model-facing `chrome_connect` surface:
@@ -221,8 +306,10 @@ export class ChromeRuntime extends Service {
    * debugger port and launches otherwise; `"reuse"` attaches only (fails when
    * nothing is listening); `"launch"` replaces the current connection with a
    * fresh managed instance — a connection this runtime owns is closed (and
-   * its Chrome killed) first, and the call fails with `CHROME_LAUNCH_FAILED`
-   * when the port is still served by an instance this runtime does not own.
+   * its Chrome killed) first, and when the port is still served by an
+   * instance this runtime does not own, the `occupiedPortPolicy` setting
+   * decides (read live): "reuse" attaches to the served instance, "refuse"
+   * fails with a `CHROME_LAUNCH_FAILED` error.
    * @param signal - optional cancellation for the connect/attach handshake.
    */
   async ensureConnection(mode: ChromeConnectMode = 'auto', signal?: AbortSignal): Promise<ChromeConnectionInfo> {
@@ -242,6 +329,32 @@ export class ChromeRuntime extends Service {
       endpoint: active.endpoint,
       browser: active.browser,
       targetId: active.targetId,
+    }
+  }
+
+  /**
+   * Re-apply the connection-scoped live settings onto the active browser:
+   * the download redirect directory and the observatory ring capacity. The
+   * plugin's `loader/volatile-update` listener calls this after a settings
+   * edit, so the change reaches the running connection immediately instead of
+   * waiting for the next connect. All other live fields (timeouts, dialog
+   * policy, caps) are read at use time and need no re-application.
+   */
+  applyLiveSettings(): void {
+    if (this.state.kind !== 'connected' && this.state.kind !== 'connected-browser') return
+    // Re-send the download redirect (browser-level setting): a changed
+    // downloadDir takes effect on the running session, and clearing it
+    // restores default handling.
+    const downloadDir = this.config.downloadDir()
+    const client = this.state.kind === 'connected' ? this.state.active.client : this.state.client
+    void client.send('Browser.setDownloadBehavior', downloadDir !== undefined
+      ? { behavior: 'allow', downloadPath: downloadDir, eventsEnabled: true }
+      : { behavior: 'default', eventsEnabled: true },
+    ).catch(() => undefined)
+    // Resize the live observatory ring; eviction follows the new capacity.
+    // (Only a fully connected page target owns an observatory.)
+    if (this.state.kind === 'connected') {
+      this.state.active.observatory.resize(this.config.observatoryMaxEntries())
     }
   }
 
@@ -274,22 +387,19 @@ export class ChromeRuntime extends Service {
         return this.openClient(normalized, { endpoint: normalized }, signal)
       }
       const version = await fetchVersionInfo(normalized, signal)
-      return this.openClient(version.webSocketDebuggerUrl, { endpoint: normalized, browser: version.Browser ?? '' }, signal)
+      return this.openClient(version.webSocketDebuggerUrl, { endpoint: normalized, browser: version.Browser ?? '', client: version.client }, signal)
     }
 
     const endpoint = normalizeDebugEndpoint(`http://${this.config.host}:${this.config.port}`)
-    // Reuse preflight: every strategy asks the port first. An instance that
-    // answers wins — except an explicit fresh launch, which refuses to spawn
-    // a doomed second Chrome over a port that is already served.
-    const existing = await probeExistingEndpoint(endpoint, signal)
-    if (existing !== undefined) {
-      if (mode === 'launch') {
-        throw new ChromeError(
-          `a Chrome debugger is already serving ${endpoint} (${existing.Browser ?? 'unknown version'}); attach to it with mode "auto" or "reuse", or free the port / pick another "port"`,
-          'CHROME_LAUNCH_FAILED',
-        )
-      }
-      return this.openClient(existing.webSocketDebuggerUrl, { endpoint, browser: existing.Browser ?? '' }, signal)
+    if (mode === 'launch') {
+      return await this.launchFresh(endpoint, signal)
+    }
+
+    // Interactive probe: the WS fallback waits for the user to approve the
+    // connection, and hands over its already-open one (one prompt).
+    const probe = await probeExistingEndpoint(endpoint, signal, { interactive: true })
+    if (probe !== undefined) {
+      return await this.attachToProbe(endpoint, probe, signal)
     }
     if (mode === 'reuse') {
       throw new ChromeError(
@@ -297,17 +407,54 @@ export class ChromeRuntime extends Service {
         'CHROME_ENDPOINT_UNREACHABLE',
       )
     }
+    return await this.spawnAndAttach(endpoint, signal)
+  }
 
+  /** Attach to a probed endpoint: verified adopts the probe's connection; occupied attaches to the browser-level endpoint directly (waiting on the caller's signal — where the user approves). */
+  private async attachToProbe(endpoint: string, probe: ChromeVersionInfo | 'occupied', signal?: AbortSignal): Promise<ActiveConnection> {
+    if (probe === 'occupied') {
+      return await this.openClient(`${endpoint.replace(/^http/i, 'ws')}/devtools/browser`, { endpoint }, signal)
+    }
+    return await this.openClient(probe.webSocketDebuggerUrl, { endpoint, browser: probe.Browser ?? '', client: probe.client }, signal)
+  }
+
+  /** Fresh launch: a free port spawns; an occupied port follows the `occupiedPortPolicy` (reuse the served instance, or refuse) — never a doomed spawn. */
+  private async launchFresh(endpoint: string, signal?: AbortSignal): Promise<ActiveConnection> {
+    if (!await probeEndpointPresence(endpoint, signal)) return await this.spawnAndAttach(endpoint, signal)
+    // The port is served by an instance this runtime does not own. The
+    // policy decides (read live): "reuse" attaches to the served instance,
+    // "refuse" fails with a clear error. No interactive question.
+    if (this.config.occupiedPortPolicy() === 'refuse') {
+      throw new ChromeError(
+        `a Chrome debug endpoint is already serving ${endpoint}; attach to it with mode "auto" or "reuse", set occupiedPortPolicy to "reuse" to attach automatically, or free the port / pick another "port"`,
+        'CHROME_LAUNCH_FAILED',
+      )
+    }
+    const probe = await probeExistingEndpoint(endpoint, signal, { interactive: true })
+    if (probe === undefined) {
+      throw new ChromeError(`the Chrome debug endpoint at ${endpoint} stopped answering before it could be attached`, 'CHROME_ENDPOINT_UNREACHABLE')
+    }
+    return await this.attachToProbe(endpoint, probe, signal)
+  }
+
+  /** Spawn a managed Chrome and attach to its debug endpoint. */
+  private async spawnAndAttach(endpoint: string, signal?: AbortSignal, portOverride?: number): Promise<ActiveConnection> {
     const launched = launchChrome({
       executablePath: this.config.executablePath,
-      port: this.config.port,
+      port: portOverride ?? this.config.port,
       host: this.config.host,
       headless: this.config.headless,
       ...this.config.userDataDir !== undefined ? { userDataDir: this.config.userDataDir } : {},
       extraArgs: this.config.extraArgs,
     })
-    const version = await waitForReady(launched.endpoint, this.config.operationTimeoutMs, signal, launched)
-    return this.openClient(version.webSocketDebuggerUrl, { endpoint: launched.endpoint, browser: version.Browser ?? '', launched }, signal)
+    try {
+      const version = await waitForReady(launched.endpoint, this.config.operationTimeoutMs(), signal, launched)
+      return await this.openClient(version.webSocketDebuggerUrl, { endpoint: launched.endpoint, browser: version.Browser ?? '', launched, client: version.client }, signal)
+    } catch (error) {
+      // waitForReady throws before openClient saw the child — clean it up here.
+      if (launched.child !== undefined) await disposeChild(launched.child).catch(() => undefined)
+      throw error
+    }
   }
 
   /**
@@ -317,10 +464,12 @@ export class ChromeRuntime extends Service {
    */
   private async openClient(
     webSocketDebuggerUrl: string,
-    info: { endpoint: string; browser?: string; launched?: LaunchedChrome },
+    info: { endpoint: string; browser?: string; launched?: LaunchedChrome; client?: CdpClient },
     signal?: AbortSignal,
   ): Promise<ActiveConnection> {
-    const client = await createCdpClient(webSocketDebuggerUrl, signal)
+    // Adopt a connection the probe already opened (and the user may already
+    // have authorized); dial a fresh one only when there is nothing to adopt.
+    const client = info.client ?? await createCdpClient(webSocketDebuggerUrl, signal)
     try {
       return await this.createTargetOnClient(client, info, signal)
     } catch (error) {
@@ -345,14 +494,16 @@ export class ChromeRuntime extends Service {
     if (existingTargetId !== undefined) {
       targetId = existingTargetId
     } else {
-      const created = await client.send('Target.createTarget', { url: 'about:blank' }, { signal }) as { targetId: string }
+      // background: true — the tools drive tabs from behind the scenes; a new
+      // tab must never yank the user's current tab out of the foreground.
+      const created = await client.send('Target.createTarget', { url: 'about:blank', background: true }, { signal }) as { targetId: string }
       targetId = created.targetId
     }
     const attached = await client.send('Target.attachToTarget', { targetId, flatten: true }, { signal }) as { sessionId: string }
     const sessionId = attached.sessionId
     const network: NetworkState = { inflight: new Set() }
     const pageRefs = new Map<string, string>()
-    const observatory = new Observatory(this.observatoryCapacity)
+    const observatory = new Observatory(this.config.observatoryMaxEntries())
     const readCursors = { net: 0, console: 0 }
     // Enable the domains the tools rely on; failures here are infrastructure errors.
     await client.send('Page.enable', undefined, { sessionId, signal })
@@ -363,17 +514,18 @@ export class ChromeRuntime extends Service {
     // Compute the full accessibility tree for a11ySnapshot; Chromium builds it
     // lazily and only tracks it while the domain is enabled. Best-effort.
     await client.send('Accessibility.enable', undefined, { sessionId, signal }).catch(() => undefined)
-    this.trackNetwork(client, sessionId, network, observatory)
-    this.trackConsole(client, sessionId, observatory)
-    this.trackDialogs(client, sessionId, observatory)
-    this.setupDownloads(client, observatory)
+    const listeners = [
+      ...this.trackNetwork(client, sessionId, network, observatory),
+      ...this.trackConsole(client, sessionId, observatory),
+      ...this.trackDialogs(client, sessionId, observatory),
+    ]
     // Fresh session: re-arm Fetch interception when mocks are active, so
     // mocks keep working after reconnects and tab switches. Awaited: a
     // fire-and-forget enable races the page's own first requests.
     if (this.netMocks.size > 0) {
       await this.enableMockInterception({ client, sessionId }).catch(() => undefined)
     }
-    return { client, targetId, sessionId, endpoint: info.endpoint, browser: info.browser ?? '', launched: info.launched, network, observatory, readCursors, pageRefs }
+    return { client, targetId, sessionId, endpoint: info.endpoint, browser: info.browser ?? '', launched: info.launched, network, observatory, readCursors, pageRefs, listeners }
   }
 
   /**
@@ -385,10 +537,11 @@ export class ChromeRuntime extends Service {
   private readonly downloadWiredClients = new WeakSet<object>()
 
   private setupDownloads(client: CdpClient, observatory: Observatory): void {
-    if (this.config.downloadDir !== undefined && this.config.downloadDir.length > 0) {
+    const downloadDir = this.config.downloadDir()
+    if (downloadDir !== undefined) {
       void client.send('Browser.setDownloadBehavior', {
         behavior: 'allow',
-        downloadPath: this.config.downloadDir,
+        downloadPath: downloadDir,
         eventsEnabled: true,
       }).catch((error: unknown) => {
         // Surface a misconfigured downloadDir instead of silently falling back to browser defaults.
@@ -404,11 +557,12 @@ export class ChromeRuntime extends Service {
       if (params.guid === undefined) return
       const filename = params.suggestedFilename ?? 'download'
       filenames.set(params.guid, filename)
+      const downloadDir = this.config.downloadDir()
       observatory.recordDownload({
         state: 'started',
         filename,
         ...params.url !== undefined ? { url: params.url } : {},
-        ...this.config.downloadDir !== undefined ? { path: `${this.config.downloadDir}/${filename}` } : {},
+        ...downloadDir !== undefined ? { path: `${downloadDir}/${filename}` } : {},
         timestamp: Date.now(),
       })
     })
@@ -417,10 +571,11 @@ export class ChromeRuntime extends Service {
       if (params.guid === undefined || params.state === undefined || params.state === 'inProgress') return
       const filename = filenames.get(params.guid) ?? 'download'
       filenames.delete(params.guid)
+      const downloadDir = this.config.downloadDir()
       observatory.recordDownload({
         state: params.state === 'completed' ? 'completed' : 'canceled',
         filename,
-        ...this.config.downloadDir !== undefined ? { path: `${this.config.downloadDir}/${filename}` } : {},
+        ...downloadDir !== undefined ? { path: `${downloadDir}/${filename}` } : {},
         ...params.receivedBytes !== undefined ? { receivedBytes: params.receivedBytes } : {},
         ...params.totalBytes !== undefined ? { totalBytes: params.totalBytes } : {},
         timestamp: Date.now(),
@@ -434,13 +589,16 @@ export class ChromeRuntime extends Service {
    * target, so auto-answering is what keeps automation alive; each opening
    * (and how it was answered) is recorded into the observatory.
    */
-  private trackDialogs(client: CdpClient, sessionId: string, observatory: Observatory): void {
-    const accept = this.config.dialogPolicy !== 'dismiss'
-    client.on('Page.javascriptDialogOpening', (raw: unknown) => {
+  private trackDialogs(client: CdpClient, sessionId: string, observatory: Observatory): (() => void)[] {
+    // Policy and prompt text resolve per dialog, so a live settings edit
+    // applies from the next opening without re-registering the listener.
+    const offDialog = client.on('Page.javascriptDialogOpening', (raw: unknown) => {
       const params = raw as { type?: string; message?: string; url?: string }
+      const accept = this.config.dialogPolicy() !== 'dismiss'
+      const promptText = this.config.dialogPromptText()
       void client.send('Page.handleJavaScriptDialog', {
         accept,
-        ...accept && this.config.dialogPromptText !== undefined ? { promptText: this.config.dialogPromptText } : {},
+        ...accept && promptText !== undefined ? { promptText } : {},
       }, { sessionId }).catch(() => undefined)
       observatory.recordDialog({
         kind: params.type ?? 'alert',
@@ -451,13 +609,14 @@ export class ChromeRuntime extends Service {
       })
     })
     void sessionId
+    return [offDialog]
   }
 
   /**
    * Subscribe to Network events: keep the `networkidle*` inflight set and
    * record every request into the observatory ring buffers.
    */
-  private trackNetwork(client: CdpClient, sessionId: string, network: NetworkState, observatory: Observatory): void {
+  private trackNetwork(client: CdpClient, sessionId: string, network: NetworkState, observatory: Observatory): (() => void)[] {
     const inflight = (params: unknown): string | undefined => (params as { requestId?: string }).requestId
     const onRequest = (raw: unknown): void => {
       const params = raw as {
@@ -512,16 +671,19 @@ export class ChromeRuntime extends Service {
         ...params.canceled !== undefined ? { canceled: params.canceled } : {},
       })
     }
-    client.on('Network.requestWillBeSent', onRequest)
-    client.on('Network.responseReceived', onResponse)
-    client.on('Network.loadingFinished', onFinished)
-    client.on('Network.loadingFailed', onFailed)
+    const disposers = [
+      client.on('Network.requestWillBeSent', onRequest),
+      client.on('Network.responseReceived', onResponse),
+      client.on('Network.loadingFinished', onFinished),
+      client.on('Network.loadingFailed', onFailed),
+    ]
     void sessionId
+    return disposers
   }
 
   /** Subscribe to Runtime/Log events recording console output and exceptions. */
-  private trackConsole(client: CdpClient, sessionId: string, observatory: Observatory): void {
-    client.on('Runtime.consoleAPICalled', (raw: unknown) => {
+  private trackConsole(client: CdpClient, sessionId: string, observatory: Observatory): (() => void)[] {
+    const offConsole = client.on('Runtime.consoleAPICalled', (raw: unknown) => {
       const params = raw as {
         type?: string
         args?: unknown[]
@@ -538,7 +700,7 @@ export class ChromeRuntime extends Service {
         ...frame?.lineNumber !== undefined ? { lineNumber: frame.lineNumber } : {},
       })
     })
-    client.on('Runtime.exceptionThrown', (raw: unknown) => {
+    const offException = client.on('Runtime.exceptionThrown', (raw: unknown) => {
       const params = raw as {
         timestamp?: number
         exceptionDetails?: {
@@ -558,7 +720,7 @@ export class ChromeRuntime extends Service {
         ...details.lineNumber !== undefined ? { lineNumber: details.lineNumber } : {},
       })
     })
-    client.on('Log.entryAdded', (raw: unknown) => {
+    const offLog = client.on('Log.entryAdded', (raw: unknown) => {
       const entry = (raw as { entry?: { level?: string; text?: string; timestamp?: number; url?: string; lineNumber?: number } }).entry
       if (entry?.text === undefined) return
       observatory.recordBrowserLog({
@@ -570,6 +732,7 @@ export class ChromeRuntime extends Service {
       })
     })
     void sessionId
+    return [offConsole, offException, offLog]
   }
 
   /** Navigate the page target to a URL and wait for the chosen lifecycle event. */
@@ -589,11 +752,11 @@ export class ChromeRuntime extends Service {
       throw new ChromeError(`navigation to ${url} failed: ${nav.errorText} (verify the URL resolves from the machine running Chrome)`, 'CHROME_CDP_ERROR')
     }
     try {
-      await waiter.wait(this.config.operationTimeoutMs, signal)
+      await waiter.wait(this.config.operationTimeoutMs(), signal)
     } catch (error) {
       if (error instanceof ChromeError && error.code === 'CHROME_TIMEOUT') {
         throw new ChromeError(
-          `navigation to ${url} timed out after ${this.config.operationTimeoutMs} ms waiting for "${waitUntil}"; `
+          `navigation to ${url} timed out after ${this.config.operationTimeoutMs()} ms waiting for "${waitUntil}"; `
           + 'networkidle* waits never settle on pages with long-polling or streaming connections — prefer "load" or "domcontentloaded", or raise operationTimeoutMs',
           'CHROME_TIMEOUT',
           { cause: error },
@@ -920,6 +1083,7 @@ export class ChromeRuntime extends Service {
       await active.client.send('Target.closeTarget', { targetId: active.targetId }, { signal })
     } finally {
       if (active.network.timer !== undefined) clearTimeout(active.network.timer)
+      for (const off of active.listeners) off()
       this.state = { kind: 'connected-browser', client: active.client, endpoint: active.endpoint, browser: active.browser, launched: active.launched }
     }
   }
@@ -1030,12 +1194,15 @@ export class ChromeRuntime extends Service {
 
   /**
    * Open a new tab (default `about:blank`) and switch the tools to drive it.
-   * The previous tab stays alive in the background.
+   * The tab is created in the background: the user's current tab keeps the
+   * foreground and the work happens behind the scenes. The previous tab stays
+   * alive in the background.
    */
   async openTab(url: string | undefined, signal?: AbortSignal): Promise<{ targetId: string; url: string; title: string }> {
     const active = await this.ensure(signal)
     const created = await active.client.send('Target.createTarget', {
       url: url !== undefined && url.length > 0 ? url : 'about:blank',
+      background: true,
     }, { signal }) as { targetId: string }
     await this.switchToTarget(created.targetId, signal)
     const meta = await this.evaluate('JSON.stringify({ url: location.href, title: document.title })', { signal })
@@ -1479,7 +1646,7 @@ export class ChromeRuntime extends Service {
       if (idleThreshold < 0) return
       if (network.inflight.size <= idleThreshold) {
         if (network.timer !== undefined) clearTimeout(network.timer)
-        network.timer = setTimeout(resolve, this.config.networkIdleMs)
+        network.timer = setTimeout(resolve, this.config.networkIdleMs())
       } else if (network.timer !== undefined) {
         clearTimeout(network.timer)
         network.timer = undefined
@@ -1592,7 +1759,6 @@ export function parseJsonString(value: unknown): unknown | undefined {
 
 /** Poll a launched Chrome endpoint until ready, surfacing immediate child exit. */
 async function waitForReady(endpoint: string, timeoutMs: number, signal: AbortSignal | undefined, launched: LaunchedChrome): Promise<ChromeVersionInfo> {
-  const retries = Math.max(5, Math.floor(timeoutMs / 100))
   const exited = launched.child !== undefined
     ? new Promise<never>((_, reject) => {
       launched.child!.once('exit', code => {
@@ -1619,21 +1785,27 @@ async function waitForReady(endpoint: string, timeoutMs: number, signal: AbortSi
     })
     : new Promise<never>(() => undefined)
   return await Promise.race([
-    waitWithRetry(endpoint, retries, signal),
+    waitWithRetry(endpoint, timeoutMs, signal),
     exited,
   ])
 }
 
-/** Retry `fetchVersionInfo` until success, abort, or budget exhaustion. */
-async function waitWithRetry(endpoint: string, retries: number, signal: AbortSignal | undefined): Promise<ChromeVersionInfo> {
+/** Retry `fetchVersionInfo` until success, abort, or the wall-clock budget is exhausted. Each WebSocket fallback dial costs at most 10s, so a count-based loop could otherwise stall for retries × budget — the deadline, not the count, bounds the wait. */
+async function waitWithRetry(endpoint: string, timeoutMs: number, signal: AbortSignal | undefined): Promise<ChromeVersionInfo> {
+  const deadline = Date.now() + timeoutMs
   let lastError: unknown
-  for (let attempt = 0; attempt < retries; attempt++) {
+  for (;;) {
     if (signal?.aborted) throw new ChromeError('Chrome endpoint wait aborted', 'CHROME_ABORTED')
+    const remaining = deadline - Date.now()
+    if (remaining <= 0) break
     try {
-      return await fetchVersionInfo(endpoint, signal)
+      return await fetchVersionInfo(endpoint, signal, { probeTimeoutMs: Math.min(DEFAULT_WS_PROBE_TIMEOUT_MS, remaining) })
     } catch (error) {
+      if (signal?.aborted) throw new ChromeError('Chrome endpoint wait aborted', 'CHROME_ABORTED', { cause: error })
       lastError = error
-      await new Promise<void>(resolve => setTimeout(resolve, 100))
+      const pause = Math.min(100, deadline - Date.now())
+      if (pause <= 0) break
+      await new Promise<void>(resolve => setTimeout(resolve, pause))
     }
   }
   if (lastError instanceof ChromeError) throw lastError

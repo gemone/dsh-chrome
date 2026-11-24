@@ -24,6 +24,7 @@ import type { ContentBlock } from '@deepseek-ai/dsh-llm'
 import { defineTool } from '@deepseek-ai/dsh-tools'
 import type { GenericCallView, ToolExecution } from '@deepseek-ai/dsh-tools'
 import type { ChromeRuntime } from '../service.ts'
+import type { ChromeSettings } from '../settings.ts'
 import {
   analyzeScreenshot,
   assertAnalysisRouteAcceptsImages,
@@ -127,17 +128,28 @@ function screenshotContent(value: ChromeScreenshotValue): ContentBlock[] {
   ]
 }
 
+/** Guidance for a route with no analysis model configured. */
+const NO_ANALYSIS_GUIDANCE = 'Use the chrome_screenshot tool to capture what the controlled Chrome page currently shows. It requires an image-capable model route; on a text-only route it refuses — use chrome_page_snapshot or chrome_snapshot to read the interface as text instead.'
+
+/** Guidance for a route with an analysis model configured (route read live). */
+function analysisGuidance(route: ScreenshotAnalysisRoute): string {
+  return `Use the chrome_screenshot tool to capture what the controlled Chrome page currently shows. On an image-capable route the capture enters context as an image. On a text-only route the capture is described in text by the configured analysis model (${route.provider}/${route.model}); pass "prompt" to steer that description. For structured reading without any model call, prefer chrome_page_snapshot.`
+}
+
 /** Register `chrome_screenshot` and its prompt guidance. */
-export function applyChromeScreenshotTool(ctx: Context, chrome: ChromeRuntime, timeoutMs: number, analysisRoute?: ScreenshotAnalysisRoute): void {
-  ctx.systemPrompt.section({
+export function applyChromeScreenshotTool(ctx: Context, chrome: ChromeRuntime, settings: ChromeSettings): () => void {
+  const disposeSection = ctx.systemPrompt.section({
     name: 'tool:chrome_screenshot',
     order: 114,
-    text: analysisRoute === undefined
-      ? 'Use the chrome_screenshot tool to capture what the controlled Chrome page currently shows. It requires an image-capable model route; on a text-only route it refuses — use chrome_page_snapshot or chrome_snapshot to read the interface as text instead.'
-      : `Use the chrome_screenshot tool to capture what the controlled Chrome page currently shows. On an image-capable route the capture enters context as an image. On a text-only route the capture is described in text by the configured analysis model (${analysisRoute.provider}/${analysisRoute.model}); pass "prompt" to steer that description. For structured reading without any model call, prefer chrome_page_snapshot.`,
+    // Evaluated per assembly: a live screenshotAnalysis edit updates the
+    // guidance without re-registering anything.
+    text: () => {
+      const route = settings.analysisRoute()
+      return route === undefined ? NO_ANALYSIS_GUIDANCE : analysisGuidance(route)
+    },
   })
 
-  ctx.tools.register(defineTool({
+  const disposeTool = ctx.tools.register(defineTool({
     name: 'chrome_screenshot',
     description: 'Capture a screenshot of the controlled Chrome page. On an image-capable route the image itself is returned; otherwise the configured screenshotAnalysis model describes it as text (when configured), or the tool refuses with text-only alternatives.',
     parameters: {
@@ -201,10 +213,13 @@ export function applyChromeScreenshotTool(ctx: Context, chrome: ChromeRuntime, t
       // The UI card follows the durable attachment, not envelope text.
       presentationMeta: (_args, value) => ({ attachmentId: value.image.attachmentId }),
     },
-    timeoutMs,
+    timeoutMs: settings.operationTimeoutMs(),
     async execute(args, exec) {
       const format = args.format ?? 'png'
       const mediaType = mediaTypeForFormat(format)
+      // The analysis route resolves per call, so a live screenshotAnalysis
+      // edit applies to the next capture without re-registering.
+      const analysisRoute = settings.analysisRoute()
 
       const attachments = ctx.get('attachments')
       if (attachments === undefined) {
@@ -313,4 +328,8 @@ export function applyChromeScreenshotTool(ctx: Context, chrome: ChromeRuntime, t
       return { card: 'generic', title: 'Capture screenshot', kind: 'read' }
     },
   }))
+  return () => {
+    disposeTool()
+    disposeSection()
+  }
 }

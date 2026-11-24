@@ -12,6 +12,7 @@ import type { ContentBlock } from '@deepseek-ai/dsh-llm'
 import { defineTool } from '@deepseek-ai/dsh-tools'
 import type { GenericCallView } from '@deepseek-ai/dsh-tools'
 import type { ChromeRuntime } from '../service.ts'
+import type { ChromeSettings } from '../settings.ts'
 
 /** Canonical `chrome_close` outcome. */
 export interface ChromeCloseValue {
@@ -19,14 +20,14 @@ export interface ChromeCloseValue {
 }
 
 /** Register `chrome_close` and its prompt guidance. */
-export function applyChromeCloseTool(ctx: Context, chrome: ChromeRuntime, timeoutMs: number): void {
-  ctx.systemPrompt.section({
+export function applyChromeCloseTool(ctx: Context, chrome: ChromeRuntime, settings: ChromeSettings): () => void {
+  const disposeSection = ctx.systemPrompt.section({
     name: 'tool:chrome_close',
     order: 118,
     text: 'Use the chrome_close tool to close the current Chrome tab or the entire browser. Closing a tab keeps the browser alive and auto-creates a new tab on next tool call. Closing the browser kills the managed Chrome process; a reused (attached) instance is only detached and keeps running.',
   })
 
-  ctx.tools.register(defineTool({
+  const disposeTool = ctx.tools.register(defineTool({
     name: 'chrome_close',
     description: 'Close the current Chrome tab or the entire browser. "tab" keeps the browser alive and auto-creates a new tab on next tool call; "browser" closes the connection and kills the Chrome process when the plugin launched it — a reused (attached) instance is only detached and stays running.',
     parameters: {
@@ -56,7 +57,7 @@ export function applyChromeCloseTool(ctx: Context, chrome: ChromeRuntime, timeou
         },
       ],
     },
-    timeoutMs,
+    timeoutMs: settings.operationTimeoutMs(),
     async execute(args, exec) {
       const what = args.what ?? 'tab'
       if (what === 'tab') {
@@ -70,4 +71,8 @@ export function applyChromeCloseTool(ctx: Context, chrome: ChromeRuntime, timeou
       return { card: 'generic', title: `Close ${args.what ?? 'tab'}`, kind: 'delete', rawInput: args.what ?? 'tab' }
     },
   }))
+  return () => {
+    disposeTool()
+    disposeSection()
+  }
 }

@@ -10,6 +10,7 @@ import { defineTool } from '@deepseek-ai/dsh-tools'
 import type { GenericCallView } from '@deepseek-ai/dsh-tools'
 import { resolveTargetSelector } from './ref-target.ts'
 import type { ChromeRuntime } from '../service.ts'
+import type { ChromeSettings } from '../settings.ts'
 
 /** Canonical `chrome_upload` outcome. */
 export interface ChromeUploadValue {
@@ -20,14 +21,14 @@ export interface ChromeUploadValue {
 }
 
 /** Register `chrome_upload` with its prompt guidance. */
-export function applyChromeUploadTool(ctx: Context, chrome: ChromeRuntime, timeoutMs: number): void {
-  ctx.systemPrompt.section({
+export function applyChromeUploadTool(ctx: Context, chrome: ChromeRuntime, settings: ChromeSettings): () => void {
+  const disposeSection = ctx.systemPrompt.section({
     name: 'tool:chrome_upload',
     order: 121,
     text: 'Use the chrome_upload tool to set local file paths on a file input (<input type="file">) — the one form interaction chrome_type cannot do. Target it by CSS selector or by the [ref=eN] id from chrome_page_snapshot. Every path must exist and be readable; absolute paths are safest.',
   })
 
-  ctx.tools.register(defineTool({
+  const disposeTool = ctx.tools.register(defineTool({
     name: 'chrome_upload',
     description: 'Set local file paths on a file input (<input type="file">) in the controlled Chrome page, by CSS selector or [ref=eN] id. Every path must exist and be readable. Absolute paths are safest.',
     parameters: {
@@ -55,7 +56,7 @@ export function applyChromeUploadTool(ctx: Context, chrome: ChromeRuntime, timeo
         { type: 'text', text: formatUpload(value) },
       ],
     },
-    timeoutMs,
+    timeoutMs: settings.operationTimeoutMs(),
     // Mutates the page's file input DOM; keep it exclusive.
     isConcurrencySafe: () => false,
     async execute(args, exec) {
@@ -70,6 +71,10 @@ export function applyChromeUploadTool(ctx: Context, chrome: ChromeRuntime, timeo
       return { card: 'generic', title: `Upload ${args.paths.length} file(s) → ${args.selector ?? args.ref ?? ''}`, kind: 'edit' }
     },
   }))
+  return () => {
+    disposeTool()
+    disposeSection()
+  }
 }
 
 /** Model-facing text for one upload outcome. */

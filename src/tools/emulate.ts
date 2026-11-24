@@ -10,6 +10,7 @@ import type { ContentBlock } from '@deepseek-ai/dsh-llm'
 import { defineTool } from '@deepseek-ai/dsh-tools'
 import type { GenericCallView } from '@deepseek-ai/dsh-tools'
 import type { ChromeRuntime } from '../service.ts'
+import type { ChromeSettings } from '../settings.ts'
 
 /** Canonical `chrome_emulate` outcome. */
 export interface ChromeEmulateValue {
@@ -18,14 +19,14 @@ export interface ChromeEmulateValue {
 }
 
 /** Register `chrome_emulate` with its prompt guidance. */
-export function applyChromeEmulateTool(ctx: Context, chrome: ChromeRuntime, timeoutMs: number): void {
-  ctx.systemPrompt.section({
+export function applyChromeEmulateTool(ctx: Context, chrome: ChromeRuntime, settings: ChromeSettings): () => void {
+  const disposeSection = ctx.systemPrompt.section({
     name: 'tool:chrome_emulate',
     order: 115,
     text: 'Use the chrome_emulate tool to control the controlled Chrome page\'s environment: viewport size/DPR/mobile, network throttling (offline/slow3G/fast3G/none), CPU throttling, geolocation, timezone, locale, and user-agent. clear: true resets everything first. Omitted fields are left unchanged.',
   })
 
-  ctx.tools.register(defineTool({
+  const disposeTool = ctx.tools.register(defineTool({
     name: 'chrome_emulate',
     description: 'Overriding the controlled Chrome page\'s environment: viewport (width/height/deviceScaleFactor/mobile), network throttling (network: offline/slow3G/fast3G/none), CPU throttling (cpuThrottlingRate), geolocation (latitude/longitude/accuracy), timezoneId, locale, userAgent, permissions (grant browser permissions), colorScheme/reducedMotion (emulated media features). clear: true resets all overrides first; omitted fields stay unchanged.',
     parameters: {
@@ -74,7 +75,7 @@ export function applyChromeEmulateTool(ctx: Context, chrome: ChromeRuntime, time
       },
       render: (_args, value): ContentBlock[] => [{ type: 'text', text: value.text }],
     },
-    timeoutMs,
+    timeoutMs: settings.operationTimeoutMs(),
     isConcurrencySafe: () => false,
     async execute(args, exec) {
       const result = await chrome.emulate({
@@ -107,4 +108,8 @@ export function applyChromeEmulateTool(ctx: Context, chrome: ChromeRuntime, time
       return { card: 'generic', title: `Emulate${args.clear === true ? ' (reset +)' : ''}${parts.length > 0 ? `: ${parts.join(', ')}` : ''}`, kind: 'edit' }
     },
   }))
+  return () => {
+    disposeTool()
+    disposeSection()
+  }
 }

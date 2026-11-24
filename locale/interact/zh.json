@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "页面交互",
+    "description": "点击、输入、滚动和按键（chrome_click / chrome_type / chrome_scroll / chrome_press_key）。"
+  }
+}

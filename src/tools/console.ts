@@ -11,6 +11,7 @@ import { defineTool } from '@deepseek-ai/dsh-tools'
 import type { GenericCallView } from '@deepseek-ai/dsh-tools'
 import { formatConsoleRead, type ConsoleLevel } from '../observatory.ts'
 import type { ChromeRuntime } from '../service.ts'
+import type { ChromeSettings } from '../settings.ts'
 
 /** Canonical `chrome_console_read` outcome. */
 export interface ChromeConsoleValue {
@@ -19,14 +20,14 @@ export interface ChromeConsoleValue {
 }
 
 /** Register `chrome_console_read` with its prompt guidance. */
-export function applyChromeConsoleTool(ctx: Context, chrome: ChromeRuntime, timeoutMs: number): void {
-  ctx.systemPrompt.section({
+export function applyChromeConsoleTool(ctx: Context, chrome: ChromeRuntime, settings: ChromeSettings): () => void {
+  const disposeSection = ctx.systemPrompt.section({
     name: 'tool:chrome_console_read',
     order: 114,
     text: 'Use the chrome_console_read tool to read the controlled Chrome page\'s console output: console.log/info/warn/error calls, uncaught exceptions, and browser log entries. Level "error" (default) shows only errors; pass all: true to dump everything. Other chrome_* tools append a [page activity: …] hint when new errors appear — follow it here.',
   })
 
-  ctx.tools.register(defineTool({
+  const disposeTool = ctx.tools.register(defineTool({
     name: 'chrome_console_read',
     description: 'Read the controlled Chrome page\'s console output: console API messages, uncaught exceptions, and browser log entries. level filters by minimum severity (default "error"); all: true reads the entire buffer instead of only unread entries.',
     parameters: {
@@ -49,7 +50,7 @@ export function applyChromeConsoleTool(ctx: Context, chrome: ChromeRuntime, time
       },
       render: (_args, value): ContentBlock[] => [{ type: 'text', text: value.text }],
     },
-    timeoutMs,
+    timeoutMs: settings.operationTimeoutMs(),
     isConcurrencySafe: () => true,
     async execute(args, exec) {
       const result = await chrome.consoleRead({
@@ -64,4 +65,8 @@ export function applyChromeConsoleTool(ctx: Context, chrome: ChromeRuntime, time
       return { card: 'generic', title: `Console (${args.level ?? 'error'})`, kind: 'read' }
     },
   }))
+  return () => {
+    disposeTool()
+    disposeSection()
+  }
 }

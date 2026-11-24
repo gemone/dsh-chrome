@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "Page reading & scripts",
+    "description": "Open URLs, evaluate JavaScript, and read pages as text or a structured element tree (chrome_navigate / chrome_evaluate / chrome_snapshot / chrome_page_snapshot)."
+  }
+}

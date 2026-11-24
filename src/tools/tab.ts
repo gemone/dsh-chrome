@@ -11,6 +11,7 @@ import type { ContentBlock } from '@deepseek-ai/dsh-llm'
 import { defineTool } from '@deepseek-ai/dsh-tools'
 import type { GenericCallView } from '@deepseek-ai/dsh-tools'
 import type { ChromeRuntime } from '../service.ts'
+import type { ChromeSettings } from '../settings.ts'
 
 /** Canonical `chrome_tab` outcome. */
 export interface ChromeTabValue {
@@ -18,14 +19,14 @@ export interface ChromeTabValue {
 }
 
 /** Register `chrome_tab` with its prompt guidance. */
-export function applyChromeTabTool(ctx: Context, chrome: ChromeRuntime, timeoutMs: number): void {
-  ctx.systemPrompt.section({
+export function applyChromeTabTool(ctx: Context, chrome: ChromeRuntime, settings: ChromeSettings): () => void {
+  const disposeSection = ctx.systemPrompt.section({
     name: 'tool:chrome_tab',
     order: 122,
     text: 'Use the chrome_tab tool to manage the controlled Chrome browser\'s tabs: action "list" shows all page tabs (attached marks the one the tools drive), "new" opens a tab and switches to it, "switch" moves the tools to another tab by index or targetId. The previously driven tab stays alive; observatory counts are per-tab and reset on switch.',
   })
 
-  ctx.tools.register(defineTool({
+  const disposeTool = ctx.tools.register(defineTool({
     name: 'chrome_tab',
     description: 'Manage the controlled Chrome browser\'s tabs: "list" shows all page tabs, "new" opens a tab (and switches to it), "switch" moves the tools to another tab by zero-based index or targetId. The previous tab stays alive.',
     parameters: {
@@ -49,7 +50,7 @@ export function applyChromeTabTool(ctx: Context, chrome: ChromeRuntime, timeoutM
       },
       render: (_args, value): ContentBlock[] => [{ type: 'text', text: value.text }],
     },
-    timeoutMs,
+    timeoutMs: settings.operationTimeoutMs(),
     // Switching mutates which tab the runtime drives; keep it exclusive.
     isConcurrencySafe: () => false,
     async execute(args, exec) {
@@ -81,4 +82,8 @@ export function applyChromeTabTool(ctx: Context, chrome: ChromeRuntime, timeoutM
       return { card: 'generic', title: `Tab ${args.action}${args.url !== undefined ? ` → ${args.url}` : ''}`, kind: args.action === 'list' ? 'read' : 'edit' }
     },
   }))
+  return () => {
+    disposeTool()
+    disposeSection()
+  }
 }

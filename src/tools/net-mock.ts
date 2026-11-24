@@ -10,6 +10,7 @@ import type { ContentBlock } from '@deepseek-ai/dsh-llm'
 import { defineTool } from '@deepseek-ai/dsh-tools'
 import type { GenericCallView } from '@deepseek-ai/dsh-tools'
 import type { ChromeRuntime } from '../service.ts'
+import type { ChromeSettings } from '../settings.ts'
 
 /** Canonical `chrome_net_mock` outcome. */
 export interface ChromeNetMockValue {
@@ -17,14 +18,14 @@ export interface ChromeNetMockValue {
 }
 
 /** Register `chrome_net_mock` with its prompt guidance. */
-export function applyChromeNetMockTool(ctx: Context, chrome: ChromeRuntime, timeoutMs: number): void {
-  ctx.systemPrompt.section({
+export function applyChromeNetMockTool(ctx: Context, chrome: ChromeRuntime, settings: ChromeSettings): () => void {
+  const disposeSection = ctx.systemPrompt.section({
     name: 'tool:chrome_net_mock',
     order: 124,
     text: 'Use the chrome_net_mock tool to answer requests matching a URL glob pattern (e.g. "https://api.example.com/v1/*") with a canned response — mock third-party dependencies, test error paths, or unblock a page. action "clear" removes all mocks and stops interception. Mocks live per connection; they do not survive a browser restart.',
   })
 
-  ctx.tools.register(defineTool({
+  const disposeTool = ctx.tools.register(defineTool({
     name: 'chrome_net_mock',
     description: 'Answer network requests matching a URL glob pattern (* wildcards, e.g. "https://api.example.com/v1/*") with a canned response in the controlled Chrome page. action "set" (default) adds/overwrites one mock; "clear" removes all mocks and stops interception. Mocks live per connection.',
     parameters: {
@@ -48,7 +49,7 @@ export function applyChromeNetMockTool(ctx: Context, chrome: ChromeRuntime, time
       },
       render: (_args, value): ContentBlock[] => [{ type: 'text', text: value.text }],
     },
-    timeoutMs,
+    timeoutMs: settings.operationTimeoutMs(),
     // Mutates connection-wide Fetch interception; keep it exclusive.
     isConcurrencySafe: () => false,
     async execute(args, exec) {
@@ -72,4 +73,8 @@ export function applyChromeNetMockTool(ctx: Context, chrome: ChromeRuntime, time
       return { card: 'generic', title: `Net mock ${args.action}${args.pattern !== undefined ? ` → ${args.pattern}` : ''}`, kind: 'edit' }
     },
   }))
+  return () => {
+    disposeTool()
+    disposeSection()
+  }
 }

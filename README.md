@@ -10,7 +10,7 @@ A [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) plugin tha
 
 | Tool | What it does | CDP |
 |---|---|---|
-| `chrome_connect` | Ensure a browser connection and report which instance serves it. `mode` chooses the strategy: `"auto"` (default) reuses an instance already listening on the debugger port, launching fresh only when none is; `"reuse"` attaches only to an existing instance; `"launch"` replaces the connection with a fresh managed instance. | `/json/version` probe + `Target.*` |
+| `chrome_connect` | Ensure a browser connection and report which instance serves it. `mode` chooses the strategy: `"auto"` (default) reuses an instance already listening on the debugger port, launching fresh only when none is; `"reuse"` attaches only to an existing instance; `"launch"` replaces the connection with a fresh managed instance — when the port is occupied by a foreign instance, the user is asked whether to reuse it or launch on a free port. Attaching may wait while the user approves the debugging connection in the Chrome window, so this tool carries a far larger budget than the rest. | `/json/version` probe (WS fallback on 404) + `Target.*` |
 | `chrome_navigate` | Open a URL, wait for a lifecycle event (`load`/`domcontentloaded`/`networkidle0`/`networkidle2`). Returns final URL + title. | `Page.navigate` |
 | `chrome_evaluate` | Evaluate JS, return JSON value. Exceptions returned as `exceptionDetails` (not an error). | `Runtime.evaluate` |
 | `chrome_snapshot` | Read the page, bounded: `format: "text"` returns the rendered visible text; `format: "markdown"` converts the page to GitHub-flavored Markdown (headings, links, lists, tables, code blocks). | `Runtime.evaluate` |
@@ -28,7 +28,7 @@ A [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) plugin tha
 | `chrome_pdf` | Print the page to a PDF file at an absolute path (landscape, printBackground, paperFormat, scale, pageRanges). | `Page.printToPDF` |
 | `chrome_storage` | Inspect or change page state: cookies (`kind: "cookies"`, scoped to the current page URL) and localStorage/sessionStorage (`kind: "local"/"session"`, current origin). Operations: get/set/remove/clear. Values are sensitive. | `Network.getCookies` etc. / `Runtime.evaluate` |
 | `chrome_upload` | Set local file paths on a file input (`<input type="file">`) by CSS selector or `[ref=eN]` — the one form interaction `chrome_type` cannot do. Every path must exist and be readable. | `DOM.setFileInputFiles` |
-| `chrome_tab` | Manage the browser's tabs: `list` (attached marks the driven tab), `new` (open + switch), `switch` (by index or targetId). The previous tab stays alive; observatory counters are per-tab and reset on switch. | `Target.getTargets` / `createTarget` / `attachToTarget` |
+| `chrome_tab` | Manage the browser's tabs: `list` (attached marks the driven tab), `new` (open + switch, created **in the background** so the user's current tab keeps the foreground), `switch` (by index or targetId, attach-only and invisible). The previous tab stays alive; observatory counters are per-tab and reset on switch. | `Target.getTargets` / `createTarget` / `attachToTarget` |
 | `chrome_mhtml` | Archive the whole page (layout + inline resources) as a single MHTML file at an absolute path. Complete offline copy; use `chrome_pdf` for documents, `chrome_screenshot` for images. | `Page.captureSnapshot` |
 | `chrome_net_mock` | Answer requests matching a URL glob (`*` wildcards) with a canned response — mock third-party APIs, test error paths. `action: "clear"` removes all mocks. Mocks live per connection. | `Fetch.enable` / `fulfillRequest` |
 
@@ -102,6 +102,7 @@ All options live under the `chrome-tool:` section. Every field is optional with 
 
 | Option | Default | Description |
 |---|---|---|
+| `occupiedPortPolicy` | `"reuse"` | **Live**: what a fresh launch (`chrome_connect mode "launch"`) does when the configured port is already served by an instance this runtime does not own. `"reuse"` attaches to the served instance; `"refuse"` fails with `CHROME_LAUNCH_FAILED`. |
 | `executablePath` | discovered | Chrome/Chromium path. Env `DSH_CHROME_EXECUTABLE_PATH` → well-known paths → PATH. |
 | `launch` | `true` | Launch a managed Chrome. `false` = attach to `cdpUrl` only. |
 | `cdpUrl` | — | Existing CDP endpoint when `launch: false` (`ws://…` or `http(s)://…`). Required when `launch` is false. |
@@ -115,11 +116,11 @@ All options live under the `chrome-tool:` section. Every field is optional with 
 | `userDataDir` | temp dir | Persistent profile directory. |
 | `extraArgs` | `[]` | Extra Chrome CLI flags. |
 | `operationTimeoutMs` | `30000` | Per-operation timeout (tool `timeoutMs`). |
+| `connectTimeoutMs` | `300000` | `chrome_connect` timeout specifically. Attaching to a Chrome that authorizes debugging connections waits for the user to approve the in-browser prompt, and a fresh launch onto an occupied port may wait for the user's reuse-or-launch answer — this budget covers those human waits. |
 | `networkIdleMs` | `500` | Quiet window before `networkidle*`. |
 | `snapshotMaxChars` | `200000` | Cap on `chrome_snapshot` output. |
 | `pageSnapshotMaxNodes` | `500` | Cap on `chrome_page_snapshot` tree nodes. |
 | `screenshotAnalysis` | — | `{ provider, model, prompt?, maxTokens? }`: an image-capable route that describes screenshots in text when the agent's own route cannot see images. See below. |
-| `navigate` / `evaluate` / `snapshot` / `pageSnapshot` / `click` / `screenshot` / `scroll` / `type` / `pressKey` / `close` / `connect` | `true` | Enable/disable individual tools. |
 
 Example profile patch (`cordis.patch.yml`):
 
@@ -133,6 +134,50 @@ Example profile patch (`cordis.patch.yml`):
 
 Config edits to `cordis.patch.yml` hot-apply — no profile restart needed (DSH watches the file transactionally).
 
+### Components (tool families)
+
+The bundle ships **six togglable component rows** instead of a single all-or-nothing
+plugin. On the Plugins page each row has its own enable switch; tool-family rows
+inject the core row's `chrome` service, so disabling the core row stops every
+family row with it.
+
+| Row id | Component | Tools |
+|---|---|---|
+| `chrome-tool` | Core — the browser service + lifecycle | `chrome_connect`, `chrome_close` |
+| `chrome-reading` | 页面读取 | `chrome_navigate`, `chrome_evaluate`, `chrome_snapshot`, `chrome_page_snapshot` |
+| `chrome-interact` | 页面交互 | `chrome_click`, `chrome_type`, `chrome_scroll`, `chrome_press_key` |
+| `chrome-capture` | 截图与文档 | `chrome_screenshot`, `chrome_pdf`, `chrome_mhtml` |
+| `chrome-observatory` | 网络与控制台 | `chrome_net_list`, `chrome_net_body`, `chrome_console_read` |
+| `chrome-session` | 标签页与存储 | `chrome_tab`, `chrome_storage`, `chrome_upload`, `chrome_emulate`, `chrome_net_mock` |
+
+Toggle a row on the Plugins page (or patch `disabled: true` against its id in
+`cordis.patch.yml`) — the change hot-applies and the model sees the new tool set
+from its next step. The per-tool toggles and the `capabilities` whitelist of
+earlier releases were replaced by these components.
+
+### Real-time settings (live edits)
+
+Most settings are declared **volatile** and take effect in place on DSH
+≥0.2.2: editing them revalidates the config, commits the new values into the
+running plugin without a restart, and the change applies from the next
+operation — the browser connection, its observatory buffers, and the running
+Chrome all stay untouched.
+
+| Live setting | How an edit applies |
+|---|---|
+| `operationTimeoutMs`, `connectTimeoutMs` | Read live inside the service for every cooperative wait; the declared `timeoutMs` of the lifecycle tools refreshes via re-registration, and a `chrome/registrations-changed` broadcast re-registers the family component rows. |
+| `networkIdleMs`, `snapshotMaxChars`, `pageSnapshotMaxNodes` | Read at each call. |
+| `dialogPolicy`, `dialogPromptText` | Read per dialog — the next JS dialog follows the new policy without re-arming listeners. |
+| `downloadDir` | Re-sent to the running browser immediately (`Browser.setDownloadBehavior`); clearing it restores default handling. |
+| `observatoryMaxEntries` | The live ring buffer resizes in place (excess entries evict immediately); new connections pick it up at creation. |
+| `screenshotAnalysis` | Read per capture; the prompt guidance text follows per assembly. |
+| `reuseExisting` | Read per implicit/explicit connect decision. |
+
+Launch-shape fields — `port`, `host`, `headless`, `executablePath`,
+`userDataDir`, `extraArgs`, `launch`, `cdpUrl` — describe the Chrome process
+itself and keep the default lifecycle: editing them restarts the plugin (and
+rebuilds the runtime config) via DSH's ordinary config update.
+
 ### Reuse an already-running Chrome (debugger port)
 
 The plugin can attach to a Chrome that is **already** exposing a DevTools
@@ -144,16 +189,30 @@ google-chrome --remote-debugging-port=9222 --user-data-dir=/tmp/chrome-debug
 ```
 
 Then just use the plugin with its default config — before launching, the
-debugger port (`host` + `port`) is probed via `/json/version`, and an instance
+debugger port (`host` + `port`) is probed via `/json/version` (with a direct
+`ws://…/devtools/browser` fallback for Chrome ≥154, which removed the HTTP
+discovery endpoints), and an instance
 already listening there is reused (attach-only: it is never killed on dispose
 or `chrome_close { "what": "browser" }`). Nothing listening → a managed Chrome
 launches as before. Set `reuseExisting: false` to always launch fresh.
+
+Two situations wait on a human rather than failing:
+
+- **Connection authorization.** Chrome builds that authorize debugging
+  connections show an in-browser prompt per connection; the interactive attach
+  path waits for the approval (and the probe's verified connection is adopted
+  by the attach, so only one prompt ever appears).
+- **Occupied port on an explicit fresh launch.** `chrome_connect { "mode":
+  "launch" }` onto a served port asks whether to reuse the running instance or
+  launch on a free port, when a user-questions service is mounted.
 
 ```yaml
 - id: chrome-tool
   config:
     port: 9222               # the port the existing Chrome listens on
     # reuseExisting: true    # default; false restores always-launch
+    # connectTimeoutMs: 300000  # budget for the human waits above
+    # capabilities: [navigate, snapshot, pageSnapshot, click, type, tab]  # whitelist; unset = all open
 ```
 
 #### Letting the agent choose
@@ -253,7 +312,7 @@ src/
 ├── index.ts          plugin entry: name/inject/Config(schemastery)/apply
 ├── service.ts        ChromeRuntime Service → ctx.chrome (lifecycle + CDP orchestration, attach-or-launch)
 ├── cdp.ts            CDP client over ws (flattened sessions, abort-aware)
-├── launcher.ts       executable discovery, Chrome spawn, /json/version polling + reuse probe
+├── launcher.ts       executable discovery, Chrome spawn, endpoint probing (HTTP + WS fallback, adoption) + free-port pick
 ├── page-walker.ts    in-page DOM walker: element tree + [ref=eN] → selector map
 ├── markdown.ts       in-page DOM→Markdown converter (chrome_snapshot format)
 ├── analysis.ts       one-shot vision-model call that describes a saved screenshot
@@ -276,7 +335,8 @@ src/
 ```
 
 - **One bundle, provider-shaped seam.** `ChromeRuntime` is `ctx.chrome`; its interface allows a future split into capability seam + provider + consumer (mirroring `ctx.web`).
-- **Attach-or-launch connect.** Before spawning, the configured debugger port is probed (`/json/version`): an instance already listening is reused — attach-only, never killed by dispose or `chrome_close` — otherwise a managed Chrome launches. `chrome_connect` lets the model pick the strategy explicitly (`auto`/`reuse`/`launch`).
+- **Attach-or-launch connect.** Before spawning, the configured debugger port is probed (`/json/version`, falling back to a direct `ws://…/devtools/browser` handshake when HTTP discovery is gone — Chrome ≥154): an instance already listening is reused — attach-only, never killed by dispose or `chrome_close` — otherwise a managed Chrome launches. `chrome_connect` lets the model pick the strategy explicitly (`auto`/`reuse`/`launch`), waits out Chrome's connection-authorization prompt on the interactive path (adopting the probe's verified connection so one approval covers the whole attach), and asks the user reuse-vs-free-port when an explicit launch finds the port occupied.
+- **Background control.** Every tab the plugin creates — the connect-time working tab and `chrome_tab new` alike — is created with `Target.createTarget({ background: true })`, and nothing in the codebase brings a tab to front: the user's current tab keeps the foreground while the tools drive theirs (`visibility: hidden`, `hasFocus: false` on the driven tab).
 - **Flattened CDP sessions.** One browser-level WebSocket drives a page target via `Target.attachToTarget({ flatten: true })`.
 - **Connected-browser state.** After `closeTab()`, the browser connection stays alive; the next tool call auto-creates a fresh page target — no Chrome restart needed.
 - **Ephemeral page refs.** `chrome_page_snapshot` keeps a `ref → selector` map inside the runtime; navigation clears it, and ref-based tools fail loudly on stale ids.
@@ -285,7 +345,7 @@ src/
 
 ## Requirements
 
-- DeepSeek Harness `^0.2.0-rc.2` (attachment admission limits and message-source extensibility this plugin builds on)
+- DeepSeek Harness `^0.2.2-rc.5` (volatile real-time settings, tool executor mounting, and the attachment admission limits this plugin builds on)
 - Chrome or Chromium on the host (or a reachable CDP endpoint)
 - Node ≥20
 

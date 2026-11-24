@@ -10,8 +10,10 @@
 
 import { spawn, type ChildProcess } from 'node:child_process'
 import { accessSync, constants } from 'node:fs'
+import { createServer as createNetServer } from 'node:net'
 import { tmpdir } from 'node:os'
 import { delimiter, join } from 'node:path'
+import { createCdpClient, type CdpClient } from './cdp.ts'
 import { ChromeError } from './types.ts'
 
 /** Common executable names searched on PATH when no explicit path is given. */
@@ -209,37 +211,45 @@ export function launchChrome(options: LaunchChromeOptions): LaunchedChrome {
   }
 }
 
-/** `/json/version` payload from a Chrome debugging endpoint. */
+/** `/json/version` payload from a Chrome debugging endpoint. `client` rides along when the probe opened the connection itself — adopt it instead of dialing again (on Chrome builds that authorize each debugging connection, a second dial means a second prompt). */
 export interface ChromeVersionInfo {
   /** Browser-level WebSocket debugger URL. */
   readonly webSocketDebuggerUrl: string
   /** Browser version string. */
   readonly 'Browser'?: string
+  readonly client?: CdpClient
 }
 
+/** Thrown when nothing answered at the network level — the endpoint may still be coming up, so callers may retry. */
+class RetryableProbeError extends ChromeError {}
+
 /**
- * Fetch and parse `/json/version` from a Chrome debugging endpoint.
+ * Fetch and parse `/json/version`. Chrome ≥154 answers a bare 404 for every
+ * `/json/*` path (HTTP discovery removed) while the browser-level WebSocket
+ * still speaks CDP, so a 404/405 falls back to verifying that endpoint
+ * directly.
  *
- * @param endpoint - `http(s)://host:port` base URL.
- * @param signal - optional cancellation.
- * @returns the version info including the browser `webSocketDebuggerUrl`.
+ * @throws {RetryableProbeError} when nothing answered at the network level —
+ * the endpoint may still be coming up, so callers may retry.
  */
-export async function fetchVersionInfo(endpoint: string, signal?: AbortSignal): Promise<ChromeVersionInfo> {
+export async function fetchVersionInfo(endpoint: string, signal?: AbortSignal, options?: { probeTimeoutMs?: number }): Promise<ChromeVersionInfo> {
   let response: Response
   try {
     response = await fetch(`${endpoint}/json/version`, { signal })
   } catch (error) {
-    throw new ChromeError(
+    // Nothing answered HTTP; a debug server shares its port with plain HTTP,
+    // so there is nothing to probe over WebSocket either.
+    throw new RetryableProbeError(
       `Chrome debugging endpoint at ${endpoint} is unreachable: ${error instanceof Error ? error.message : String(error)}`,
       'CHROME_ENDPOINT_UNREACHABLE',
       { cause: error },
     )
   }
   if (!response.ok) {
-    throw new ChromeError(
-      `Chrome /json/version at ${endpoint} returned HTTP ${response.status}`,
-      'CHROME_ENDPOINT_UNREACHABLE',
-    )
+    if (response.status === 404 || response.status === 405) {
+      return await probeOverWebSocket(endpoint, signal, options)
+    }
+    throw new ChromeError(`Chrome /json/version at ${endpoint} returned HTTP ${response.status}`, 'CHROME_ENDPOINT_UNREACHABLE')
   }
   const json = await response.json() as Record<string, unknown>
   const webSocketDebuggerUrl = json.webSocketDebuggerUrl
@@ -249,34 +259,123 @@ export async function fetchVersionInfo(endpoint: string, signal?: AbortSignal): 
   return { webSocketDebuggerUrl, ...'Browser' in json ? { Browser: json.Browser as string } : {} }
 }
 
+/** Budget for one WebSocket fallback dial; `0` (with a signal) waits for that signal alone. */
+export const DEFAULT_WS_PROBE_TIMEOUT_MS = 10_000
+
 /**
- * Probe whether a Chrome debugger is already serving an endpoint, treating a
- * miss as data rather than an error. This is the reuse preflight: before
- * spawning a managed Chrome, the configured debug port is asked whether an
- * instance already listens there, so the running instance can be attached to
- * instead of launching a second one over the same port.
- *
- * @param endpoint - `http(s)://host:port` base URL.
- * @param signal - optional cancellation.
- * @returns the version info when a debugger answers, `undefined` when nothing
- * usable responds (nothing listening, non-CDP HTTP service, bad payload).
- * @throws {ChromeError} `CHROME_ABORTED` when the caller cancelled the probe.
+ * Verify the browser-level CDP WebSocket (`ws://…/devtools/browser`) with one
+ * `Browser.getVersion` round-trip. The opened connection rides along in the
+ * result so the caller adopts it instead of dialing — and re-authorizing — a
+ * second one. `probeTimeoutMs: 0` with a signal means "wait for the signal":
+ * the interactive path, where a stalled handshake is Chrome's authorization
+ * prompt waiting for the user.
  */
-export async function probeExistingEndpoint(endpoint: string, signal?: AbortSignal): Promise<ChromeVersionInfo | undefined> {
-  // Two attempts: a Chrome that is still starting binds its debug port late,
-  // so a single miss could race an instance mid-startup and spawn a doomed
-  // second Chrome over it. One short retry buys that window cheaply.
+async function probeOverWebSocket(endpoint: string, signal?: AbortSignal, options?: { probeTimeoutMs?: number }): Promise<ChromeVersionInfo> {
+  const wsUrl = `${endpoint.replace(/^http/i, 'ws')}/devtools/browser`
+  const budgetMs = options?.probeTimeoutMs ?? DEFAULT_WS_PROBE_TIMEOUT_MS
+  const interactive = signal !== undefined && budgetMs <= 0
+  const budget = interactive ? undefined : AbortSignal.timeout(budgetMs > 0 ? budgetMs : DEFAULT_WS_PROBE_TIMEOUT_MS)
+  const probeSignal = budget === undefined ? signal : signal === undefined ? budget : AbortSignal.any([signal, budget])
+  const client = await createCdpClient(wsUrl, probeSignal)
+  try {
+    const { product } = await client.send('Browser.getVersion', {}, { signal: probeSignal }) as { product?: unknown }
+    if (typeof product !== 'string' || product.length === 0) {
+      throw new ChromeError(`Chrome WebSocket probe at ${wsUrl} answered CDP but reported no product`, 'CHROME_ENDPOINT_UNREACHABLE')
+    }
+    return { webSocketDebuggerUrl: wsUrl, Browser: product, client }
+  } catch (error) {
+    client.close()
+    if (signal?.aborted) throw error
+    if (error instanceof ChromeError && error.code === 'CHROME_ABORTED') {
+      // The budget expired, not the caller: say so, and point at the
+      // authorization prompt a stalled handshake usually means.
+      throw new ChromeError(
+        `Chrome WebSocket probe at ${wsUrl} did not answer within ${budgetMs}ms — on Chrome builds that authorize debugging connections, the browser may be waiting for the user to approve`,
+        'CHROME_ENDPOINT_UNREACHABLE',
+        { cause: error },
+      )
+    }
+    throw error
+  }
+}
+
+/**
+ * Reuse preflight: does a debugger already serve this endpoint? Returns the
+ * verified version (with an open connection to adopt when the probe opened
+ * one), `'occupied'` when the port answers but CDP is unverified (Chrome ≥154
+ * shape — never spawn over it), or `undefined` when nothing listens.
+ *
+ * `interactive: true` gives the WS dial no budget (wait for the caller's
+ * signal — one connection, one authorization prompt). A network-level miss
+ * retries once on either path: it never touched the WebSocket, so the retry
+ * prompts nothing.
+ */
+export async function probeExistingEndpoint(
+  endpoint: string,
+  signal?: AbortSignal,
+  options?: { probeTimeoutMs?: number; interactive?: boolean },
+): Promise<ChromeVersionInfo | 'occupied' | undefined> {
+  const probeOptions = options?.interactive === true ? { ...options, probeTimeoutMs: 0 } : options
   for (let attempt = 0; attempt < 2; attempt++) {
     try {
-      return await fetchVersionInfo(endpoint, signal)
+      return await fetchVersionInfo(endpoint, signal, probeOptions)
     } catch (error) {
       if (signal?.aborted) {
         throw new ChromeError('Chrome endpoint probe aborted', 'CHROME_ABORTED', { cause: error })
       }
-      if (attempt === 0) await new Promise<void>(resolve => setTimeout(resolve, 400))
+      if (error instanceof RetryableProbeError && attempt === 0) {
+        // A Chrome still starting binds its debug port late; one short retry
+        // buys that window instead of spawning a doomed second Chrome.
+        await new Promise<void>(resolve => setTimeout(resolve, 400))
+        continue
+      }
+      if (error instanceof RetryableProbeError) return undefined
+      // The port answered HTTP but CDP is unverified — occupied either way.
+      return 'occupied'
     }
   }
   return undefined
+}
+
+/**
+ * Fresh-launch preflight: whether anything serves HTTP on the endpoint,
+ * checked without touching the WebSocket (no authorization prompt). Cancellation
+ * is rethrown, never mistaken for "the port is free".
+ */
+export async function probeEndpointPresence(endpoint: string, signal?: AbortSignal): Promise<boolean> {
+  for (let attempt = 0; attempt < 2; attempt++) {
+    try {
+      const response = await fetch(`${endpoint}/json/version`, { signal })
+      await response.arrayBuffer().catch(() => undefined)
+      return true
+    } catch (error) {
+      if (signal?.aborted) {
+        throw new ChromeError('Chrome endpoint presence probe aborted', 'CHROME_ABORTED', { cause: error })
+      }
+      if (attempt === 0) await new Promise<void>(resolve => setTimeout(resolve, 400))
+    }
+  }
+  return false
+}
+
+/** Reserve one ephemeral TCP port and release it — for launching on a free port when the configured one is occupied. */
+export async function findFreePort(host = '127.0.0.1'): Promise<number> {
+  return await new Promise((resolve, reject) => {
+    const server = createNetServer()
+    const settle = (error: unknown, port?: number): void => {
+      server.close(() => (error !== undefined ? reject(error) : resolve(port as number)))
+    }
+    server.unref()
+    server.on('error', error => settle(error))
+    server.listen(0, host, () => {
+      const address = server.address()
+      if (address === null || typeof address === 'string') {
+        settle(new ChromeError('could not reserve a free TCP port', 'CHROME_LAUNCH_FAILED'))
+        return
+      }
+      settle(undefined, address.port)
+    })
+  })
 }
 
 /**

@@ -1,7 +1,21 @@
 # dsh-chrome bundle layer.
-# A patch overlay applied when a profile lists this bundle. Inserts the
-# chrome-tool plugin row, resolved by package name (Node module resolution in
-# the profile directory). See README.md for install/enable instructions.
+# A patch overlay applied when a profile lists this bundle. Inserts the core
+# component row (the browser service + lifecycle tools, row id `chrome-tool`)
+# and one family component row per tool group — each row is independently
+# togglable on the Plugins page and can be patched/disabled by id from the
+# profile. Family rows inject the core row's `chrome` service: disabling the
+# core row stops every family row with it. See README.md for install/enable
+# instructions.
 - insert:
     - id: chrome-tool
       name: "@gemone/dsh-chrome"
+    - id: chrome-reading
+      name: "@gemone/dsh-chrome/reading"
+    - id: chrome-interact
+      name: "@gemone/dsh-chrome/interact"
+    - id: chrome-capture
+      name: "@gemone/dsh-chrome/capture"
+    - id: chrome-observatory
+      name: "@gemone/dsh-chrome/observatory"
+    - id: chrome-session
+      name: "@gemone/dsh-chrome/session"

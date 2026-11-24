@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "网络与控制台",
+    "description": "观察页面自己发出的网络请求、控制台输出和异常（chrome_net_list / chrome_net_body / chrome_console_read）。"
+  }
+}

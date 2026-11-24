@@ -14,21 +14,22 @@ import type { ContentBlock } from '@deepseek-ai/dsh-llm'
 import { defineTool } from '@deepseek-ai/dsh-tools'
 import type { GenericCallView } from '@deepseek-ai/dsh-tools'
 import type { ChromeRuntime } from '../service.ts'
+import type { ChromeSettings } from '../settings.ts'
 import { formatPageSnapshot } from '../page-walker.ts'
 
 /** Register `chrome_page_snapshot` and its prompt guidance. */
-export function applyChromePageSnapshotTool(ctx: Context, chrome: ChromeRuntime, timeoutMs: number, maxNodes: number): void {
-  ctx.systemPrompt.section({
+export function applyChromePageSnapshotTool(ctx: Context, chrome: ChromeRuntime, settings: ChromeSettings): () => void {
+  const disposeSection = ctx.systemPrompt.section({
     name: 'tool:chrome_page_snapshot',
     order: 119,
     text: 'Use the chrome_page_snapshot tool to read the controlled page as a structured element tree: roles, names, and states, with every interactive element carrying a [ref=eN] id. Pass that ref to chrome_click / chrome_type / chrome_scroll instead of writing CSS selectors. Refs are invalidated by navigation — take a fresh snapshot after navigating. Prefer this over chrome_screenshot whenever the current model cannot see images.',
   })
 
-  ctx.tools.register(defineTool({
+  const disposeTool = ctx.tools.register(defineTool({
     name: 'chrome_page_snapshot',
     description: 'Read the controlled Chrome page as a structured element tree (roles, names, states) with [ref=eN] ids usable by chrome_click/chrome_type/chrome_scroll. format "a11y" reads the accessibility tree instead (semantic roles/states, no refs). Works without image support; bounded by the node budget.',
     parameters: {
-      maxNodes: { type: 'integer', description: `Maximum tree nodes to emit (default ${maxNodes}).` },
+      maxNodes: { type: 'integer', description: `Maximum tree nodes to emit (default ${settings.pageSnapshotMaxNodes()}).` },
       format: {
         type: 'string',
         description: 'Tree flavor: "dom" (default, [ref=eN] actionable) or "a11y" (accessibility tree, semantic read).',
@@ -52,11 +53,11 @@ export function applyChromePageSnapshotTool(ctx: Context, chrome: ChromeRuntime,
         { type: 'text', text: `${formatPageSnapshot(value)}${chrome.activityHint()}` },
       ],
     },
-    timeoutMs,
+    timeoutMs: settings.operationTimeoutMs(),
     // Mutates the runtime's page-ref map, so overlapping calls could swap the
     // map under a concurrently-acting sibling; keep it exclusive.
     async execute(args, exec) {
-      const budget = args.maxNodes ?? maxNodes
+      const budget = args.maxNodes ?? settings.pageSnapshotMaxNodes()
       if (!Number.isInteger(budget) || budget < 1) throw new Error('maxNodes must be a positive integer')
       if (args.format === 'a11y') {
         const ax = await chrome.a11ySnapshot(budget, exec.signal)
@@ -83,4 +84,8 @@ export function applyChromePageSnapshotTool(ctx: Context, chrome: ChromeRuntime,
       return { card: 'generic', title: args.format === 'a11y' ? 'Snapshot accessibility tree' : 'Snapshot page structure', kind: 'read' }
     },
   }))
+  return () => {
+    disposeTool()
+    disposeSection()
+  }
 }
