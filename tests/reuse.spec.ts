@@ -2,7 +2,7 @@ import { describe, expect, it } from 'vitest'
 import { createServer, type AddressInfo, type Server } from 'node:http'
 import { Context } from '@deepseek-ai/cordis'
 import { WebSocketServer, type WebSocket } from 'ws'
-import { findFreePort, probeExistingEndpoint, waitForEndpoint } from '../src/launcher.ts'
+import { findFreePort, hostForUrl, normalizeDebugEndpoint, probeExistingEndpoint, waitForEndpoint } from '../src/launcher.ts'
 import { ChromeRuntime, type ChromeRuntimeConfig } from '../src/service.ts'
 import { ChromeError } from '../src/types.ts'
 
@@ -155,6 +155,23 @@ function launchConfig(port: number, reuseExisting: boolean): ChromeRuntimeConfig
     occupiedPortPolicy: () => 'refuse',
   }
 }
+
+describe('hostForUrl', () => {
+  it('brackets IPv6 literals and passes everything else through', () => {
+    expect(hostForUrl('::1')).toBe('[::1]')
+    expect(hostForUrl('2001:db8::1')).toBe('[2001:db8::1]')
+    expect(hostForUrl('[::1]')).toBe('[::1]')
+    expect(hostForUrl('127.0.0.1')).toBe('127.0.0.1')
+    expect(hostForUrl('localhost')).toBe('localhost')
+    expect(hostForUrl('chrome.example.internal')).toBe('chrome.example.internal')
+    expect(hostForUrl(' ::1 ')).toBe('[::1]')
+  })
+
+  it('builds a bracketed endpoint for an IPv6 host and a plain one for IPv4', () => {
+    expect(normalizeDebugEndpoint(`http://${hostForUrl('::1')}:9222`)).toBe('http://[::1]:9222')
+    expect(normalizeDebugEndpoint(`http://${hostForUrl('127.0.0.1')}:9222`)).toBe('http://127.0.0.1:9222')
+  })
+})
 
 describe('probeExistingEndpoint', () => {
   it('returns a verified probe when a debugger serves the endpoint', async () => {

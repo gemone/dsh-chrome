@@ -47,6 +47,20 @@ export function normalizeDebugEndpoint(endpoint: string): string {
   return endpoint.includes('://localhost:') ? endpoint.replace('://localhost:', '://127.0.0.1:') : endpoint
 }
 
+/**
+ * Bracket an IPv6 literal host for use inside a URL authority (`::1` becomes
+ * `[::1]`); a host that is already bracketed, or any non-IPv6 host (IPv4,
+ * `localhost`, a DNS name), passes through unchanged. Node-side socket calls
+ * (`listen(port, host)`) must keep using the raw host — brackets are a URL
+ * syntax, not an address syntax.
+ * @param host - the configured debug endpoint host.
+ */
+export function hostForUrl(host: string): string {
+  const trimmed = host.trim()
+  if (trimmed.startsWith('[') && trimmed.endsWith(']')) return trimmed
+  return trimmed.includes(':') ? `[${trimmed}]` : trimmed
+}
+
 /** Resolve `headless` config to the Chrome `--headless` flag value. */
 export function headlessFlag(headless: boolean | 'new'): string {
   if (headless === false) return ''
@@ -205,7 +219,7 @@ export function launchChrome(options: LaunchChromeOptions): LaunchedChrome {
   }
 
   return {
-    endpoint: normalizeDebugEndpoint(`http://${host}:${options.port}`),
+    endpoint: normalizeDebugEndpoint(`http://${hostForUrl(host)}:${options.port}`),
     child,
     recentOutput: () => outputTail,
   }

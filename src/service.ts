@@ -22,7 +22,7 @@ import { CdpClient, createCdpClient } from './cdp.ts'
 import { networkConditions } from './emulation.ts'
 import { urlMatchesGlob } from './url-glob.ts'
 import { formatAxTree, storageReadExpression, storageWriteExpression, type RawAxNode } from './a11y.ts'
-import { DEFAULT_WS_PROBE_TIMEOUT_MS, disposeChild, fetchVersionInfo, findFreePort, launchChrome, normalizeDebugEndpoint, probeEndpointPresence, probeExistingEndpoint, type ChromeVersionInfo, type LaunchedChrome } from './launcher.ts'
+import { DEFAULT_WS_PROBE_TIMEOUT_MS, disposeChild, fetchVersionInfo, findFreePort, hostForUrl, launchChrome, normalizeDebugEndpoint, probeEndpointPresence, probeExistingEndpoint, type ChromeVersionInfo, type LaunchedChrome } from './launcher.ts'
 import { DEFAULT_PAGE_SNAPSHOT_MAX_NODES } from './page-walker.ts'
 import { DEFAULT_SNAPSHOT_MAX_CHARS, type ChromeSettings } from './settings.ts'
 import { markdownExpression, type RawMarkdownSnapshot } from './markdown.ts'
@@ -390,7 +390,7 @@ export class ChromeRuntime extends Service {
       return this.openClient(version.webSocketDebuggerUrl, { endpoint: normalized, browser: version.Browser ?? '', client: version.client }, signal)
     }
 
-    const endpoint = normalizeDebugEndpoint(`http://${this.config.host}:${this.config.port}`)
+    const endpoint = normalizeDebugEndpoint(`http://${hostForUrl(this.config.host)}:${this.config.port}`)
     if (mode === 'launch') {
       return await this.launchFresh(endpoint, signal)
     }

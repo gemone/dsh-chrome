@@ -111,7 +111,7 @@ All options live under the `chrome-tool:` section. Every field is optional with 
 | `dialogPromptText` | — | Prompt text sent when accepting a `prompt` dialog. |
 | `downloadDir` | — | Directory downloads are redirected into (absolute path). Unset = browser default handling. When set, the download lifecycle (started/completed/canceled) is recorded into the observatory and readable via `chrome_console_read`. |
 | `port` | `9222` | Remote debugging port. |
-| `host` | `127.0.0.1` | Chrome debug endpoint host. |
+| `host` | `127.0.0.1` | Chrome debug endpoint host. IPv6 literals (`::1`, `2001:db8::1`) are bracketed automatically in every `http(s)://` / `ws://` URL the plugin builds. |
 | `headless` | `"new"` | `true` (old headless), `"new"`, or `false` (visible window). |
 | `userDataDir` | temp dir | Persistent profile directory. |
 | `extraArgs` | `[]` | Extra Chrome CLI flags. |
@@ -345,7 +345,7 @@ src/
 
 ## Requirements
 
-- DeepSeek Harness `^0.2.2-rc.5` (volatile real-time settings, tool executor mounting, and the attachment admission limits this plugin builds on)
+- DeepSeek Harness `^0.2.0-rc.2` (all plugin APIs are verified against that release). The **live settings** hot-apply additionally needs a host whose plugin loader carries the volatile config machinery (DSH ≥0.2.2-alpha line); on older hosts a settings edit simply restarts the plugin instead — behavior stays correct.
 - Chrome or Chromium on the host (or a reachable CDP endpoint)
 - Node ≥20
 
